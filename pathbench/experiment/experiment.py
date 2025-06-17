@@ -4,6 +4,7 @@ import slideflow as sf
 import os
 import torch
 from ..benchmarking.benchmark import benchmark, optimize_parameters, extract_features
+from ..benchmarking.benchmark_sis import benchmark_sis
 import random
 import shutil
 import logging
@@ -11,6 +12,23 @@ from huggingface_hub import login
 import multiprocessing as mp
 import torch.multiprocessing as torch_mp
 torch_mp.set_sharing_strategy('file_system')
+import json
+import numpy as np
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+def set_global_seed(seed: Optional[int]):
+    if seed is None:
+        return
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # for full PyTorch determinism you may also want:
+    torch.backends.cudnn.deterministic   = True
+    torch.backends.cudnn.benchmark       = False 
 
 def read_config(config_file : str):
     """
@@ -25,25 +43,6 @@ def read_config(config_file : str):
     with open(config_file, 'r') as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
     return config
-
-# Check if GPU is available
-if torch.cuda.is_available():
-    try:
-        # Check if device already set
-        device = torch.cuda.current_device()
-    except NameError:
-        # Set device to GPU
-        device = torch.device('cuda')
-        torch.cuda.set_device(device)
-        logging.info(f'Using GPU: {torch.cuda.get_device_name(device)}')
-else:
-    try:
-        # Check if device already set
-        device = torch.cuda.current_device()
-    except NameError:
-        # Set device to CPU
-        device = torch.device('cpu')
-        logging.info('Using CPU')
         
 class Experiment():
     """
@@ -77,6 +76,26 @@ class Experiment():
     def __init__(self, config_file : str):
         self.config = read_config(config_file)
         logging.info(f"Configuration file {config_file} loaded")
+
+        # Check if GPU is available
+        if torch.cuda.is_available():
+            try:
+                # Check if device already set
+                device = torch.cuda.current_device()
+            except NameError:
+                # Set device to GPU
+                device = torch.device('cuda')
+                torch.cuda.set_device(device)
+                logging.info(f'Using GPU: {torch.cuda.get_device_name(device)}')
+        else:
+            try:
+                # Check if device already set
+                device = torch.cuda.current_device()
+            except NameError:
+                # Set device to CPU
+                device = torch.device('cpu')
+                logging.info('Using CPU')
+
         self.load_datasets()
         #Set Hugging Face token
         if 'hf_key' in self.config:
@@ -103,7 +122,11 @@ class Experiment():
     def run(self):
         if self.config['experiment']['mode'] == 'benchmark':
             logging.info("Running benchmarking mode...")
-            self.benchmark()
+            if self.config['experiment']['task'] == 'image_retrieval':
+                logging.info("Running image retrieval benchmark...")
+                self.benchmark_sis()  # New branch for image retrieval
+            else:
+                self.benchmark()      # Existing MIL benchmark
         elif self.config['experiment']['mode'] == 'optimization':
             logging.info("Running optimization mode...")
             self.optimize_parameters()
@@ -136,16 +159,19 @@ class Experiment():
                 annotations=annotation_file
             )
             logging.info(f"Project {self.project_name} loaded with annotations: {self.project.annotations}")
-        else:
-            logging.info(f"Creating new project {self.project_name}")
-            os.makedirs(project_path, exist_ok=True)
-            # Create an empty project (no initial slides/tiles/tfrecords)
-            self.project = sf.create_project(
-                name=self.project_name,
-                root=project_path,
-                annotations=annotation_file
-            )
-            logging.info(f"Project {self.project_name} created with annotations: {self.project.annotations}")
+            return
+        
+        logging.info(f"Creating new project {self.project_name}")
+        os.makedirs(project_path, exist_ok=True)
+
+        # Create an empty project (no initial slides/tiles/tfrecords)
+        self.project = sf.create_project(
+            name=self.project_name,
+            root=project_path,
+            annotations=annotation_file
+        )
+        self.clear_datasets()
+        logging.info(f"Project {self.project_name} created with annotations: {self.project.annotations}")
 
         # Retrieve datasets list and validate
         datasets = self.config.get('datasets', [])
@@ -154,12 +180,20 @@ class Experiment():
 
         # Add each dataset as a source to the project
         for source in datasets:
-
             name = source.get('name')
             if not name:
                 raise ValueError(f"Dataset name is missing in the configuration for project '{self.project_name}'.")
             
-            def resolve_path(path):
+            self.project.add_source(
+                name=source['name'],
+                slides=self.resolve_path(source.get('slide_path')),
+                tfrecords=self.resolve_path(source.get('tfrecord_path')),
+                tiles=self.resolve_path(source.get('tile_path')) if self.config['experiment'].get('save_tiles', None) else None,
+                roi=self.resolve_path(source.get("roi_path", None))
+            )
+            logging.info(f"Added source '{source['name']}' to project '{self.project_name}'")
+
+    def resolve_path(self, path):
                 if not path:
                     return None
                 is_absolute = os.path.isabs(path)
@@ -172,20 +206,22 @@ class Experiment():
                     if not os.path.exists(path):
                         raise ValueError(f"Path '{path}' does not exist.")
                     return path
-            
+    
+    def clear_datasets(self):
+        with open(self.project.dataset_config, "r") as f:
+            data = json.load(f)
 
-            self.project.add_source(
-                name=source['name'],
-                slides=resolve_path(source.get('slide_path')),
-                tfrecords=resolve_path(source.get('tfrecord_path')),
-                tiles=resolve_path(source.get('tile_path')) if self.config['experiment'].get('save_tiles', None) else None,
-            )
-            logging.info(f"Added source '{source['name']}' to project '{self.project_name}'")
+        data.clear()
 
-        
+        with open(self.project.dataset_config, "w") as f:
+            json.dump(data, f, indent=4)
+
     def benchmark(self):
         #Iterate over all possible combinations of hyperparameters
         benchmark(self.config, self.project)
+    
+    def benchmark_sis(self):
+        benchmark_sis(self.config, self.project)
 
     def optimize_parameters(self):
         #Optimize the MIL pipeline
