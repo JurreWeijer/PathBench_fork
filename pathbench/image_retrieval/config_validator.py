@@ -9,7 +9,7 @@ class SISConfigValidator:
     # allowed values—everything stored in lower case
     ALLOWED_QC = {"gaussianv2", "otsu-clahe"}
     ALLOWED_DATASET_USE = {"training", "validation", "testing"}
-    ALLOWED_VIZ_METHODS = {"umap-mean", "umap-median", "umap-none"}
+    ALLOWED_VIZ_METHODS = {"umap-mean", "umap-median", "umap-none", "patch_selection-extensive", "patch_selection-simple"}
     ALLOWED_UMAP_KEYS = {"n_neighbors", "min_dist", "metric"}
     ALLOWED_NORMALIZATIONS = {"reinhard", "macenko", "cyclegan"}
     ALLOWED_FEATURE_EXTRACTORS = {
@@ -18,7 +18,7 @@ class SISConfigValidator:
         "swav", "phikon", "phikon_v2", "gigapath", "barlow_twins", "hibou_b",
         "hibou_l", "pathoduet_ihc", "pathoduet_he", "kaiko_s8", "kaiko_s16",
         "kaiko_b8", "kaiko_b16", "kaiko_l14", "h_optimus_0", "h_optimus_1",
-        "virchow", "virchow2", "exaone_path"
+        "virchow", "virchow2", "exaone_path", "titan_slide", "gigapath_slide", "prism_slide"
     }
     ALLOWED_SEARCH_METHODS = {"yottixel", "sish"}
     ALLOWED_MOSAIC_BASE = {"splice_rgb", "splice_features", "yottixel_rgb", "yottixel_features", "sdm_features"}
@@ -42,7 +42,7 @@ class SISConfigValidator:
         exp = self.cfg.get("experiment", {})
         # required keys
         for key in ("project_name", "annotation_file", "report",
-                    "tile_extraction_only", "feature_extraction_only",
+                    "skip_extracted", "skip_feature_extraction", "save_tiles", "mixed_precision",
                     "num_workers", "qc", "qc_filters", "evaluation"):
             if key not in exp:
                 self.errors.append(f"[experiment] missing required key: '{key}'")
@@ -58,7 +58,7 @@ class SISConfigValidator:
                 self.errors.append(f"`experiment.annotation_file` not found: {ann}")
 
         # booleans
-        for bool_key in ("report", "tile_extraction_only", "feature_extraction_only"):
+        for bool_key in ("report", "skip_extracted", "skip_feature_extraction", "save_tiles", "mixed_precision", "resume"):
             if not isinstance(exp.get(bool_key), bool):
                 self.errors.append(f"`experiment.{bool_key}` must be boolean")
 

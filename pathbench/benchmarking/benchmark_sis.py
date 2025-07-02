@@ -63,9 +63,9 @@ from ..image_retrieval.yottixel_search import YottixelDatabase
 from ..image_retrieval.sish_search import SISHDatabase
 from ..image_retrieval.config_validator import SISConfigValidator
 from ..image_retrieval.utils import load_patch_dicts_from_tfr, load_patch_dicts_pickle, save_patch_dicts_pickle, save_retrieval_metrics, save_retrieval_results_to_excel
-from ..image_retrieval.vis_patch_selection import generate_extensive_patch_selection_report_pdf, generate_simple_patch_selection_report_pdf
+from ..image_retrieval.vis_patch_selection import generate_patch_selection_report_pdf
 from ..image_retrieval.evaluation import evaluate_retrieval_metrics, parse_metric_names
-from ..image_retrieval.vis_retrieval_results import generate_image_retrieval_report_by_class, generate_image_retrieval_report_pdf
+from ..image_retrieval.vis_retrieval_results import generate_image_retrieval_report_pdf
 from ..image_retrieval.vis_umap import run_umap_visualizations
 
 import slideflow as sf
@@ -158,7 +158,7 @@ def perform_feature_extraction(config, project, all_data, combination_dict, stri
         string_without_mil (str): Identifier string used for saving paths (typically excluding '_mil').
 
     Returns:
-        bags: Output of `generate_bags` #TODO: what is the output?
+        bags: Output of `generate_bags`
     """
     logging.info("Starting feature extraction...")
 
@@ -182,6 +182,7 @@ def perform_feature_extraction(config, project, all_data, combination_dict, stri
     )
 
     logging.info(f"Feature extraction completed successfully. Features stored at: {bags}")
+
     return bags
 
 def create_slide_mosaic(config, all_data, method, percentile, mosaics_base, features_folder_path, patch_size):
@@ -319,9 +320,10 @@ def make_mosaic(
 
     # ---- 2) Build the mosaic filename & run selection if needed ----
     mosaic_pkl = os.path.join(mosaic_folder, f"{slide_id}.pkl")
+    patch_ids_npz = os.path.join(mosaic_folder, f"{slide_id}.npz")
 
     if not (os.path.exists(mosaic_pkl) and os.path.getsize(mosaic_pkl) > 0):
-        selected = patch_selection_fn(config, patch_data["patches"], percentile)
+        selected, patch_ids, coords = patch_selection_fn(config, patch_data["patches"], percentile)
         subset = [patch_data["patches"][i] for i in selected]
 
         save_patch_dicts_pickle(
@@ -329,6 +331,8 @@ def make_mosaic(
             mosaic_pkl,
             compress=3
         )
+
+        np.savez_compressed(patch_ids_npz, bin_ids=patch_ids, coords=coords)
 
     return (slide_id, mosaic_pkl, None)
 
@@ -474,9 +478,6 @@ def benchmark_sis(config, project):
         combination_dict = {param: value for param, value in zip(benchmark_parameters.keys(), combination)}
         logging.info(f"Processing combination: {combination_dict}")
 
-        # Set default values for missing keys
-        combination_dict.setdefault("roi", False)
-
         # Strings used for filenames and identifiers
         tile_string = f"{combination_dict['tile_px']}px_{str(combination_dict['tile_um']) if str(combination_dict['tile_um']).endswith('x') else str(combination_dict['tile_um']) + 'x'}"
         feature_string = "_".join([f"{value}" for key, value in combination_dict.items() if key not in ['mil', 'loss', 'augmentation', 'activation_function', 'optimizer', 'mosaic_method', 'search_method', 'roi']])
@@ -488,15 +489,9 @@ def benchmark_sis(config, project):
 
         # ---- Tile extraction ----
         all_data = perform_tile_extraction(config, project, combination_dict)
-        if config['experiment'].get('tile_extraction_only', False):
-            logging.info("Tile extraction only mode enabled. Exiting after tile extraction.")
-            continue
 
         # ---- Feature extraction ----
         bags = perform_feature_extraction(config, project, all_data, combination_dict, feature_string)
-        if config['experiment'].get('feature_extraction_only', False):
-            logging.info("Feature extraction only mode enabled. Exiting after feature extraction.")
-            continue
 
         # ---- Mosaic creation ----
         mosaic = combination_dict['mosaic_method']
@@ -530,13 +525,14 @@ def benchmark_sis(config, project):
 
         if config['experiment']['report']:
             try:
-                generate_extensive_patch_selection_report_pdf(
+                generate_patch_selection_report_pdf(
                     config=config,
                     all_data=all_data,
                     slide_mosaic_paths=slide_mosaic_paths,
                     mosaic_method=mosaic_method,
                     pdf_base=pdf_base,
-                    patch_size=combination_dict['tile_px'],
+                    patch_px=combination_dict["tile_px"],
+                    patch_um=combination_dict['tile_um']
                 )
             except Exception as e:
                 logging.warning(f"Patch visualization failed for {mosaic_method}_{feature_string}: {e}")
@@ -589,10 +585,11 @@ def benchmark_sis(config, project):
 
         if config['experiment']['report']:
             try:
-                generate_image_retrieval_report_by_class(
+                generate_image_retrieval_report_pdf(
+                    config=config,
                     results=results,
                     all_data=all_data,
-                    output_path=combo_eval_folder
+                    output_dir=combo_eval_folder,   
                 )
             except Exception as e:
                 logging.warning(f"Retrieval visualization failed for {search_method}_{mosaic_method}_{feature_string}: {e}")

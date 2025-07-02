@@ -95,7 +95,7 @@ def splice_rgb_patch_selection(config, patches, percentile_threshold):
 
         selected_indices.append(i)
 
-    return selected_indices
+    return selected_indices, None, None
 
 def splice_features_patch_selection(config, patches, percentile_threshold):
     """
@@ -153,7 +153,7 @@ def splice_features_patch_selection(config, patches, percentile_threshold):
 
         selected_indices.append(i)
 
-    return selected_indices
+    return selected_indices, None, None
 
 def yottixel_rgb_patch_selection(config, patches, percentage_selected):	
     """
@@ -218,7 +218,7 @@ def yottixel_rgb_patch_selection(config, patches, percentage_selected):
                     selected_indices.append(patches.index(cluster_patches[sidx]))
                     break
 
-    return selected_indices
+    return selected_indices, None, None
 
 def yottixel_features_patch_selection(config, patches, percentage_selected):
     """
@@ -252,7 +252,7 @@ def yottixel_features_patch_selection(config, patches, percentage_selected):
         logging.warning("Empty patch list provided.")
         return []
     
-    kmeans_clusters = 15  # TODO: move to config if needed
+    kmeans_clusters = 9  # TODO: move to config if needed
 
     # ---- Stage 1: Feature clustering ----
     features = np.array([p['feature'] for p in patches])
@@ -288,7 +288,7 @@ def yottixel_features_patch_selection(config, patches, percentage_selected):
                     selected_indices.append(patches.index(cluster_patches[sidx]))
                     break
 
-    return selected_indices
+    return selected_indices, None, None
 
 def sdm_features_patch_selection(config, patches, percentile):
     """
@@ -332,17 +332,19 @@ def sdm_features_patch_selection(config, patches, percentile):
 
     # ---- Compute distances and discretize into integer bins ----
     dists = np.linalg.norm(feats - centroid[None, :], axis=1)
-    bins = np.rint(dists).astype(int)
+    bin_ids = np.rint(dists).astype(int)
 
     # ---- Randomly pick one patch per bin ----
     rng = np.random.default_rng(config["experiment"].get("random_state", None))
     selected = []
-    for bin_id in np.unique(bins):
-        candidates = np.where(bins == bin_id)[0]
+    for bin_id in np.unique(bin_ids):
+        candidates = np.where(bin_ids == bin_id)[0]
         chosen = int(rng.choice(candidates))
         selected.append(chosen)
 
-    return selected
+    coords = np.array([ [int(p['loc'][0]), int(p['loc'][1])] for p in patches ])
+
+    return selected, bin_ids, coords
 
 """def splice_patch_selection(patches, features, percentile_threshold):
     

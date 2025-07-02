@@ -1,4 +1,4 @@
-import openslide
+from openslide import OpenSlide
 import slideflow as sf
 import math
 import os
@@ -9,537 +9,877 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.gridspec import GridSpec
 import numpy as np
 import random
+import cv2
+import joblib
+import numpy as np
+from shapely.geometry import polygon
+from shapely.geometry import box, Polygon, MultiPolygon
+from shapely.ops import unary_union
+import os
+import torch
+from PIL import Image, ImageDraw, ImageFont
+import pandas as pd
+import math 
+import slideflow as sf
+import cv2
+from typing import Dict, Optional
 
 from ..image_retrieval.utils import load_patch_dicts_pickle
+from .vis_utils import get_dataset_name_for_slide, get_path_from_dataset, crop_roi, load_qupath_rois, load_patch_dicts_pickle
 
-def visualize_patch_selection_overview(
-    pdf,
-    all_data,
-    slide_ids: list,
-    slide_mosaic_paths: dict,
-    thumb_size: int = 512,
-    tile_size: int = 256,
-    dpi: int = 80,
-    inflation: float = 1.2,
-    linewidth: float = 3.0
-) -> None:
+VIS_PATCH_SIZE = 256
+MAX_THUMB_SIZE = 2048
+GRID_COLS = 8
+MARKER_PX = 35
+PATCH_ALPHA = 0.4
+LEGEND_MARGING = 20
+SWATCH_SIZE = 30
+SWATCH_PAD = 10
+BORDER_WIDTH = 3
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+PATCH_VIS_METHODS = ["extensive", "simple"]
+
+def merge_patch_polygons_by_bin(coords: np.ndarray,
+                                bin_ids: np.ndarray,
+                                patch_size: int):
     """
-    Add overview pages to `pdf`: each page shows up to 3 slide thumbnails
-    (stacked vertically) with inflated red squares marking selected patches.
-
     Args:
-        pdf:               an open PdfPages to append to.
-        all_data:          slideflow Dataset for locating slide files.
-        slide_ids:         list of slide IDs in display order.
-        slide_mosaic_paths:map slide_id → mosaic .pkl.
-        thumb_size:        max thumbnail dimension in px.
-        tile_size:         patch width/height in px.
-        dpi:               DPI for pdf.savefig.
-        inflation:         factor to enlarge each patch square.
-        linewidth:         thickness of the rectangle edges.
+        coords:      (N,2) array of (x, y) origins for each patch
+        bin_ids:     length-N array of integer bin assignments
+        patch_size:  width/height of each patch square
+
+    Returns:
+        dict[int, Polygon or MultiPolygon]:
+            mapping each bin_id → the merged Polygon(s) for that bin
     """
-    slides_per_page = 3
-    for start in range(0, len(slide_ids), slides_per_page):
-        chunk = slide_ids[start:start + slides_per_page]
-        rows = len(chunk)
+    merged = {}
 
-        # One column, rows rows
-        fig, axes = plt.subplots(rows, 1, figsize=(8.5, 11))
-        if rows == 1:
-            axes = [axes]
+    for b in np.unique(bin_ids):
+        # get indices of patches in this bin
+        idxs = np.where(bin_ids == b)[0]
+        
+        # create a list of individual patch boxes
+        boxes = []
+        for i in idxs:
+            x, y = coords[i]
+            boxes.append(box(x, y, x + patch_size, y + patch_size))
+        
+        # union all boxes: adjacent boxes coalesce into bigger polygons
+        unioned = unary_union(boxes)
+        merged[b] = unioned
 
-        for ax, slide_id in zip(axes, chunk):
-            # load slide + thumbnail
-            path = all_data.find_slide(slide=slide_id)
-            if path is None:
-                ax.axis("off")
-                continue
-            slide = openslide.OpenSlide(path)
-            thumb = slide.get_thumbnail((thumb_size, thumb_size))
-            W, H = slide.dimensions
-            sx, sy = thumb.width / W, thumb.height / H
+    return merged
 
-            # draw thumbnail
-            ax.imshow(thumb)
-            ax.set_title(slide_id, fontsize=10)
-            ax.axis("off")
-
-            # load mosaic
-            mosaic = load_patch_dicts_pickle(slide_mosaic_paths[slide_id])
-            for p in mosaic["patches"]:
-                x, y = p["loc"]
-                w = tile_size * sx
-                h = tile_size * sy
-                # inflate
-                dx = (inflation - 1) * w / 2
-                dy = (inflation - 1) * h / 2
-
-                rect = Rectangle(
-                    (x * sx - dx, y * sy - dy),
-                    w * inflation, h * inflation,
-                    linewidth=linewidth,
-                    edgecolor="red",
-                    facecolor="none"
-                )
-                ax.add_patch(rect)
-
-        # rasterize images to keep PDF small
-        for a in fig.axes:
-            for im in a.get_images():
-                im.set_rasterized(True)
-
-        plt.tight_layout()
-        pdf.savefig(fig, dpi=dpi, bbox_inches="tight")
-        plt.close(fig)
-
-def visualize_patch_selection_details(
-    pdf: PdfPages,
-    slide_ids: list,
-    slide_mosaic_paths: dict,
-    num_patches: int = 10,
-    patch_size: int = 256
-) -> None:
+def generate_distinct_bgr_colors(n):
     """
-    Add one detail page per slide: a single row of up to `num_patches` randomly sampled patch images.
-
-    Args:
-        pdf: open PdfPages to append to.
-        slide_ids: list of slide IDs.
-        slide_mosaic_paths: map slide_id → mosaic .pkl.
-        num_patches: max crops to show per slide.
-        patch_size: not used for layout, but kept for signature consistency.
+    Generate n visually distinct colors in BGR by sampling the HSV hue channel.
     """
-    for slide_id in slide_ids:
-        mosaic_pkl = slide_mosaic_paths[slide_id]
-        try:
-            mosaic = load_patch_dicts_pickle(mosaic_pkl)
-        except Exception as e:
-            logging.warning(f"Cannot load mosaic {slide_id}: {e}")
-            continue
+    hues = np.linspace(0, 179, n, endpoint=False, dtype=int)
+    colors = []
+    for h in hues:
+        # full saturation & value for vivid colors
+        hsv = np.uint8([[[h, 255, 255]]])           # shape (1,1,3)
+        bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)   # also (1,1,3)
+        b, g, r = bgr[0,0].tolist()
+        colors.append((b, g, r))
+    return colors
 
-        patches = mosaic["patches"]
-        if not patches:
-            logging.warning(f"No patches for {slide_id}")
-            continue
-
-        chosen = random.sample(patches, min(num_patches, len(patches)))
-        tfr = sf.TFRecord(mosaic["properties"]["tfr_path"])
-
-        cols = len(chosen)
-        fig, axes = plt.subplots(1, cols, figsize=(cols * 1.5, 2))
-        if cols == 1:
-            axes = [axes]
-
-        # remove all spacing between subplots
-        fig.subplots_adjust(left=0, right=1, bottom=0, top=1,
-                            wspace=0, hspace=0)
-
-        for ax, p in zip(axes, chosen):
-            rec = tfr[p["tfr_index"]]
-            img = sf.io.decode_image(bytes(rec["image_raw"]))
-            ax.imshow(np.array(img))
-            ax.axis("off")
-
-        fig.suptitle(slide_id, fontsize=10)
-        plt.tight_layout(pad=1)
-
-        for sub in fig.axes:
-            for im in sub.get_images():
-                im.set_rasterized(True)
-
-        pdf.savefig(fig, dpi=100, bbox_inches="tight")
-        plt.close(fig)
-
-def generate_simple_patch_selection_report_pdf(
+def visualize_selected_patches_simple(
     config: dict,
-    all_data,
-    slide_mosaic_paths: dict,
-    pdf_path: str,
-    thumb_size: int = 512,
-    num_detail_patches: int = 10,
-    tile_size: int = None
-) -> None:
+    slide_id: str,
+    slide_path: str,
+    mosaics_folder: str
+) -> Image.Image:
     """
-    Create a single PDF where each page contains three blocks of:
-      • an overview thumbnail with red patch rectangles (5% oversized)
-      • a row of up to `num_detail_patches` example crops, touching each other
+    Simple patch selection visualization, refactored to use crop_roi.
 
     Args:
-        config (dict): Experiment configuration (for tile_px if tile_size None).
-        all_data: slideflow Dataset for locating slides.
-        slide_mosaic_paths (dict): slide_id → mosaic.pkl path.
-        pdf_path (str): output PDF path.
-        thumb_size (int): max side length for thumbnails.
-        num_detail_patches (int): number of random patches per block.
-        tile_size (int, optional): patch width/height in px.
+        config: experiment config dict (for ROI lookup)
+        slide_id: slide identifier
+        slide_path: path to .tiff file
+        mosaics_folder: folder containing slide_id.pkl
+
+    Returns:
+        composite PIL Image
     """
-    # derive tile_size if needed
-    if tile_size is None:
-        tpx = config["benchmark_parameters"]["tile_px"]
-        tile_size = tpx[0] if isinstance(tpx, (list,tuple)) else tpx
+    # 1) Crop and resize ROI (or full slide) into a thumbnail
+    thumb_img, (W, H), scale = crop_roi(config, slide_path, slide_id, MAX_THUMB_SIZE, BORDER_WIDTH)
 
-    slide_ids = list(slide_mosaic_paths.keys())
-    os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+    # 2) Paste into square canvas with border
+    canvas = Image.new("RGB", (MAX_THUMB_SIZE, MAX_THUMB_SIZE), (255, 255, 255))
+    ox = (MAX_THUMB_SIZE - thumb_img.width) // 2
+    oy = (MAX_THUMB_SIZE - thumb_img.height) // 2
+    canvas.paste(thumb_img, (ox, oy))
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle(
+        [BORDER_WIDTH//2, BORDER_WIDTH//2,
+         MAX_THUMB_SIZE - BORDER_WIDTH//2 - 1,
+         MAX_THUMB_SIZE - BORDER_WIDTH//2 - 1],
+        outline="black", width=BORDER_WIDTH
+    )
 
-    with PdfPages(pdf_path) as pdf:
-        for i in range(0, len(slide_ids), 3):
-            chunk = slide_ids[i:i+3]
-            fig = plt.figure(figsize=(11, 8.5))
-            # 6 rows: overview, detail, overview, detail, ...
-            gs = GridSpec(6, num_detail_patches,
-                          figure=fig,
-                          height_ratios=[3, 1] * len(chunk),
-                          wspace=0, hspace=0.5)
-            # expand to full page
-            fig.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.01)
+    # 3) Load patches
+    mosaic_path = os.path.join(mosaics_folder, f"{slide_id}.pkl")
+    patch_data = load_patch_dicts_pickle(mosaic_path, reconstruct_features=False)
+    tfr = sf.TFRecord(patch_data["properties"]["tfr_path"])
+    patches = patch_data["patches"]
 
-            for bi, slide_id in enumerate(chunk):
-                # overview
-                ax_thumb = fig.add_subplot(gs[2*bi, :])
-                slide_path = all_data.find_slide(slide=slide_id)
-                if slide_path:
-                    slide = openslide.OpenSlide(slide_path)
-                    thumb = slide.get_thumbnail((thumb_size, thumb_size))
-                    W, H = slide.dimensions
-                    sx, sy = thumb.width / W, thumb.height / H
+    patch_images = []
+    for p in patches:
+        rec = tfr[p["tfr_index"]]
+        img = sf.io.decode_image(bytes(rec["image_raw"]))
+        patch_images.append(Image.fromarray(np.array(img)))
 
-                    ax_thumb.imshow(thumb)
-                    ax_thumb.set_title(slide_id, fontsize=10)
-                    ax_thumb.axis("off")
+    # 4) Build composite grid below thumbnail
+    n = len(patch_images)
+    rows = math.ceil(n / GRID_COLS)
+    total_h = MAX_THUMB_SIZE + rows * VIS_PATCH_SIZE
 
-                    mosaic = load_patch_dicts_pickle(slide_mosaic_paths[slide_id])
-                    pad_x = 0.05 * tile_size * sx
-                    pad_y = 0.05 * tile_size * sy
+    composite = Image.new("RGB", (MAX_THUMB_SIZE, total_h), (255,255,255))
+    composite.paste(canvas, (0, 0))
+    for i, img in enumerate(patch_images):
+        r, c = divmod(i, GRID_COLS)
+        composite.paste(img, (c * VIS_PATCH_SIZE, MAX_THUMB_SIZE + r * VIS_PATCH_SIZE))
 
-                    for p in mosaic["patches"]:
-                        x, y = p["loc"]
-                        rect = Rectangle(
-                            (x * sx - pad_x, y * sy - pad_y),
-                            tile_size * sx + 2*pad_x,
-                            tile_size * sy + 2*pad_y,
-                            edgecolor="red", facecolor="none", linewidth=1.5
-                        )
-                        ax_thumb.add_patch(rect)
-                else:
-                    ax_thumb.text(0.5,0.5,"Slide not found",ha="center",va="center")
-                    ax_thumb.axis("off")
+    # 5) Annotate ROI thumbnail with patch markers
+    cv_img = cv2.cvtColor(np.array(composite), cv2.COLOR_RGB2BGR)
+    scale_x = thumb_img.width / W
+    scale_y = thumb_img.height / H
 
-                # detail row
-                mosaic = load_patch_dicts_pickle(slide_mosaic_paths[slide_id])
-                patches = mosaic["patches"]
-                chosen = random.sample(patches, min(num_detail_patches, len(patches)))
-                tfr = sf.TFRecord(mosaic["properties"]["tfr_path"])
+    for idx, p in enumerate(patches):
+        x_full, y_full = p['loc']
+        dx = int((x_full - 0) * scale_x + ox)
+        dy = int((y_full - 0) * scale_y + oy)
+        cv2.rectangle(cv_img, (dx, dy), (dx+MARKER_PX, dy+MARKER_PX), (0,0,0), -1)
+        text = str(idx)
+        (tw, th), _ = cv2.getTextSize(text, FONT, 1.0, 2)
+        tx = dx + (MARKER_PX - tw)//2
+        ty = dy + (MARKER_PX + th)//2
+        cv2.putText(cv_img, text, (tx, ty), FONT, 1.0, (255,255,255), 2)
 
-                for j in range(num_detail_patches):
-                    ax = fig.add_subplot(gs[2*bi + 1, j])
-                    if j < len(chosen):
-                        rec = tfr[chosen[j]["tfr_index"]]
-                        img = sf.io.decode_image(bytes(rec["image_raw"]))
-                        ax.imshow(np.array(img))
-                    ax.axis("off")
+    # 6) Annotate grid patches
+    for i in range(n):
+        r, c = divmod(i, GRID_COLS)
+        org = (c * VIS_PATCH_SIZE + 5,
+               MAX_THUMB_SIZE + r * VIS_PATCH_SIZE + int(VIS_PATCH_SIZE * 0.2))
+        cv2.putText(cv_img, str(i), org, FONT, 1.0, (0,0,0), 2, cv2.LINE_AA)
 
-            # rasterize to shrink size
-            for ax in fig.axes:
-                for im in ax.get_images():
-                    im.set_rasterized(True)
+    return Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
 
-            pdf.savefig(fig, dpi=100, bbox_inches="tight")
-            plt.close(fig)
-
-    print(f"Saved combined PDF report to: {pdf_path}")
-
-##########################################################################################################################################################
-##########################################################################################################################################################
-
-def visualize_selected_patches_slide(
-    slide_id,
-    slide_path,
-    mosaic_data,
-    method,
-    patch_size=256,
-    thumb_size=800,       # ↓ lowered from 1024 to 800 to shrink PDF
-    save_path=None
-):
+def visualize_selected_patches_extensive(
+    config: dict,
+    slide_id: str,
+    slide_path: str,
+    mosaics_folder: str,
+    patch_px: int,
+    patch_um: float
+) -> Optional[Image.Image]:
     """
-    Draw a single figure showing:
-      1) the full‐slide thumbnail with red boxes around each selected patch, and
-      2) each selected patch crop underneath, labeled by index.
-    All image axes (thumbnail and patch crops) are forced to rasterize,
-    so that the final PDF embeds them as bitmaps at modest dpi.
+    Two-panel overview: left = colored bins, right = numbered patches,
+    both over the same ROI-cropped thumbnail (with true patch-size overlays).
+    Below: full-width grid of patch thumbnails.
+
+    Args:
+        config:         your config dict.
+        slide_id:       ID of the slide.
+        slide_path:     Filesystem path to the WSI.
+        mosaics_folder: Dir containing {slide_id}.pkl + .npz.
+        patch_px:       Tile side length (px) AT THE EXTRACTION MPP.
+        patch_um:       Microns per side of patch (so patch MPP = patch_um/patch_px).
     """
-    try:
-        # ---- unpack the mosaic_data ----
-        mosaic_patches    = mosaic_data["patches"]
-        mosaic_properties = mosaic_data["properties"]
+    # --- 1) Figure out where the ROI CSV lives, load its bounds ---
+    ds_name     = get_dataset_name_for_slide(config, slide_path)
+    roi_folder  = get_path_from_dataset(config, ds_name, "roi_path")
+    roi_csv     = os.path.join(roi_folder, f"{slide_id}.csv")
 
-        # ---- open TFRecord to decode patch images later ----
-        tfr = sf.TFRecord(mosaic_properties["tfr_path"])
+    roi_geom    = load_qupath_rois(roi_csv)
+    minx, miny, maxx, maxy = roi_geom.bounds
+    W, H        = maxx - minx, maxy - miny
 
-        # ---- load the WSI and grab a downscaled thumbnail ----
-        slide = openslide.OpenSlide(slide_path)
-        thumb = slide.get_thumbnail((thumb_size, thumb_size))
-        dims = slide.dimensions
-        scale_x = thumb.width / dims[0]
-        scale_y = thumb.height / dims[1]
+    # --- 2) Build a centered thumbnail + border via your crop_roi helper ---
+    thumb_img, (W2, H2), _scale = crop_roi(config, slide_path, slide_id, MAX_THUMB_SIZE, BORDER_WIDTH)
+    tw, th      = thumb_img.size
+    ox          = (MAX_THUMB_SIZE - tw) // 2
+    oy          = (MAX_THUMB_SIZE - th) // 2
 
-        num_patches = len(mosaic_patches)
-        num_cols = min(6, num_patches)
-        num_rows = math.ceil(num_patches / num_cols)
+    canvas      = Image.new("RGB", (MAX_THUMB_SIZE, MAX_THUMB_SIZE), "white")
+    canvas.paste(thumb_img, (ox, oy))
+    base_cv     = cv2.cvtColor(np.array(canvas), cv2.COLOR_RGB2BGR)
 
-        # ---- build a GridSpec: first row=thumbnail, then a small spacer, then patches ----
-        fig = plt.figure(figsize=(12, 3 + 1.5 * num_rows))
-        gs = GridSpec(2 + num_rows, num_cols, figure=fig,
-                      height_ratios=[4, 0.1] + [1]*num_rows)
+    # --- 3) Compute true full-res patch size in px ---
+    slide       = OpenSlide(slide_path)
+    slide_mpp   = float(slide.properties.get(
+                       "openslide.mpp-x",
+                       slide.properties.get("tiff_mpp_x", 1.0)
+                   ))
+    extraction_mpp   = patch_um / patch_px
+    scale_factor     = extraction_mpp / slide_mpp
+    fullres_patch_px = max(1, int(round(patch_px * scale_factor)))
 
-        # ---- Plot the thumbnail ----
-        ax_thumb = fig.add_subplot(gs[0, :])
-        ax_thumb.imshow(thumb)
-        ax_thumb.set_title(f"{slide_id} – Selected patches ({method})", fontsize=10)
-        ax_thumb.axis("off")
+    # --- 4) Load & merge the bin polygons in full-res coords ---
+    npz_path    = os.path.join(mosaics_folder, f"{slide_id}.npz")
+    data        = np.load(npz_path)
+    bin_ids     = data["bin_ids"]
+    coords      = data["coords"]
 
-        # ---- draw red rectangles + labels on top of the thumbnail ----
-        for i, patch in enumerate(mosaic_patches):
-            x, y = patch['loc']
-            rect = Rectangle(
-                (x * scale_x, y * scale_y),
-                patch_size * scale_x, patch_size * scale_y,
-                linewidth=1.5, edgecolor='red', facecolor='none'
-            )
-            ax_thumb.add_patch(rect)
-            ax_thumb.text(
-                x * scale_x, y * scale_y,
-                str(i + 1), color='white', fontsize=6,
-                backgroundcolor='red', va='top'
-            )
+    merged = {}
+    for b in np.unique(bin_ids):
+        idxs = np.where(bin_ids == b)[0]
+        boxes = []
+        for i in idxs:
+            x0, y0 = coords[i]
+            boxes.append(Polygon([
+                (x0, y0),
+                (x0 + fullres_patch_px, y0),
+                (x0 + fullres_patch_px, y0 + fullres_patch_px),
+                (x0, y0 + fullres_patch_px),
+            ]))
+        merged[b] = unary_union(boxes)
 
-        # ↓↓↓ Force entire thumbnail + vector overlays to become one bitmap ↓↓↓
-        ax_thumb.set_rasterized(True)
+    # --- 5) Prepare two copies for bin & index overlays ---
+    thumb_bin   = base_cv.copy()
+    thumb_idx   = base_cv.copy()
 
-        # ---- Plot each patch crop below the thumbnail ----
-        for i, patch in enumerate(mosaic_patches):
-            row = 2 + (i // num_cols)
-            col = i % num_cols
-            ax = fig.add_subplot(gs[row, col])
+    # mapping factors full-res→thumb
+    scale_x     = tw / W
+    scale_y     = th / H
 
-            record = tfr[patch['tfr_index']]
-            img = sf.io.decode_image(bytes(record['image_raw']))
-            ax.imshow(np.array(img))
-            ax.axis("off")
-            ax.set_title(f"{i + 1}", fontsize=6)
+    # --- 6) Draw colored bins on thumb_bin ---
+    overlay     = thumb_bin.copy()
+    unique_bins = sorted(merged.keys())
+    palette     = generate_distinct_bgr_colors(len(unique_bins))
+    for i, b in enumerate(unique_bins):
+        color = palette[i]
+        poly  = merged[b]
+        parts = [poly] if isinstance(poly, Polygon) else poly.geoms
+        for pg in parts:
+            pts = np.array([
+                [int((x-minx)*scale_x + ox),
+                 int((y-miny)*scale_y + oy)]
+                for (x, y) in pg.exterior.coords
+            ], np.int32).reshape(-1,1,2)
+            cv2.fillPoly(overlay, [pts], color)
+            cv2.polylines(overlay, [pts], True, color, 2)
+    thumb_bin = cv2.addWeighted(overlay, PATCH_ALPHA, thumb_bin, 1-PATCH_ALPHA, 0)
 
-            # ↓↓↓ Force each patch crop to be rasterized ↓↓↓
-            # (Matplotlib’s imshow already draws as an "AxesImage", but this
-            #  ensures any future overlays are flattened.)
-            ax.set_rasterized(True)
+    # --- ** LEGEND back in here ** ---
+    # compute text width for safety
+    max_text_width = max(
+        cv2.getTextSize(f"bin {b}", FONT, 1.0, 2)[0][0]
+        for b in unique_bins
+    )
+    # right-side, vertically centered
+    legend_x = MAX_THUMB_SIZE - LEGEND_MARGING - SWATCH_SIZE - max_text_width - 10
+    total_legend_height = len(unique_bins)*SWATCH_SIZE + (len(unique_bins)-1)*SWATCH_PAD
+    legend_y = (MAX_THUMB_SIZE - total_legend_height) // 2
+    for i, bin_id in enumerate(unique_bins):
+        color = palette[i]
+        y0    = legend_y + i*(SWATCH_SIZE + SWATCH_PAD)
+        # swatch
+        cv2.rectangle(
+            thumb_bin,
+            (legend_x, y0),
+            (legend_x + SWATCH_SIZE, y0 + SWATCH_PAD),
+            color, -1
+        )
+        # label
+        cv2.putText(
+            thumb_bin,
+            f"bin {bin_id}",
+            (legend_x + SWATCH_SIZE + 5, y0 + SWATCH_SIZE - 5),
+            FONT, 1.0, (0,0,0), 2, cv2.LINE_AA
+        )
 
-        plt.tight_layout()
+    # --- 7) Draw patch indices on thumb_idx ---
+    patch_data = load_patch_dicts_pickle(
+        os.path.join(mosaics_folder, f"{slide_id}.pkl"),
+        reconstruct_features=False
+    )
+    for idx, p in enumerate(patch_data["patches"]):
+        x0, y0 = p["loc"]
+        dx = int((x0-minx)*scale_x + ox)
+        dy = int((y0-miny)*scale_y + oy)
+        cv2.rectangle(thumb_idx, (dx,dy),
+                      (dx+MARKER_PX,dy+MARKER_PX),
+                      (0,0,0), -1)
+        txt = str(idx)
+        (w_txt,h_txt),_ = cv2.getTextSize(txt, FONT, 1.0, 2)
+        tx = dx + (MARKER_PX - w_txt)//2
+        ty = dy + (MARKER_PX + h_txt)//2
+        cv2.putText(thumb_idx, txt, (tx,ty),
+                    FONT, 1.0, (255,255,255), 2)
 
-        # ---- Save to disk or return the figure ----
-        if save_path:
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            # Use dpi=80 or 100—anything higher just bloats the file size
-            fig.savefig(save_path, dpi=80, bbox_inches='tight')
-            plt.close(fig)
-            logging.info(f"Saved patch visualization to: {save_path}")
-            return None
+    # --- 8) Load patch thumbnails for the grid below ---
+    tfr = sf.TFRecord(patch_data["properties"]["tfr_path"])
+    patch_imgs = []
+    for p in patch_data["patches"]:
+        rec = tfr[p["tfr_index"]]
+        img = sf.io.decode_image(bytes(rec["image_raw"]))
+        patch_imgs.append(Image.fromarray(np.array(img)))
 
-        return fig
+    # --- 9) Composite the two thumbs + full-width grid below ---
+    cols   = GRID_COLS * 2
+    n      = len(patch_imgs)
+    rows   = math.ceil(n / cols)
+    H_tot  = MAX_THUMB_SIZE + rows * VIS_PATCH_SIZE
 
-    except Exception as e:
-        logging.warning(f"Visualization failed for {slide_id}: {e}")
-        return None
+    comp = Image.new("RGB", (2*MAX_THUMB_SIZE, H_tot), "white")
+    comp.paste(Image.fromarray(cv2.cvtColor(thumb_bin, cv2.COLOR_BGR2RGB)), (0,0))
+    comp.paste(Image.fromarray(cv2.cvtColor(thumb_idx, cv2.COLOR_BGR2RGB)), (MAX_THUMB_SIZE,0))
 
-def generate_extensive_patch_selection_report_pdf(
+    for i, img in enumerate(patch_imgs):
+        r, c = divmod(i, cols)
+        comp.paste(img, (c*VIS_PATCH_SIZE, MAX_THUMB_SIZE + r*VIS_PATCH_SIZE))
+
+    # --- 10) Label the grid patches below ---
+    cvc = cv2.cvtColor(np.array(comp), cv2.COLOR_BGR2RGB)
+    for i in range(n):
+        r, c = divmod(i, cols)
+        x = c*VIS_PATCH_SIZE + 5
+        y = MAX_THUMB_SIZE + r*VIS_PATCH_SIZE + int(VIS_PATCH_SIZE*0.2)
+        cv2.putText(cvc, str(i), (x,y), FONT, 1.0, (0,0,0), 2)
+
+    return Image.fromarray(cvc)
+
+def add_title(img: Image.Image, title: str, bar_height: int = 150,
+                 font_scale: float = 3.0, thickness: int = 4) -> Image.Image:
+    """
+    Add a title bar above a PIL image by using OpenCV putText.
+    No external font file needed—just OpenCV’s HersheySimplex.
+    """
+    # 1) Convert PIL→OpenCV
+    arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+    h_img, w_img = arr.shape[:2]
+
+    # 2) Make a new canvas with extra bar_height at top
+    canvas = np.full((h_img + bar_height, w_img, 3), 255, dtype=np.uint8)
+
+    # 3) Paste the image into the bottom
+    canvas[bar_height:] = arr
+
+    # 4) Measure text size
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    (text_w, text_h), baseline = cv2.getTextSize(title, font, font_scale, thickness)
+
+    # 5) Compute center position
+    x = (w_img - text_w) // 2
+    # y at roughly middle of the bar; OpenCV’s y is baseline of text
+    y = (bar_height + text_h) // 2
+
+    # 6) Draw text in black
+    cv2.putText(canvas, title, (x, y), font, font_scale, (0,0,0), thickness, cv2.LINE_AA)
+
+    # 7) Convert back to PIL
+    return Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+
+def generate_patch_selection_report_pdf(
     config,
     all_data,
     slide_mosaic_paths,
     mosaic_method,
     pdf_base,
-    patch_size=None,
-    max_per_file=200
+    patch_px,
+    patch_um, 
+    max_per_file: int = 200
 ):
     """
-    Iterate over every slide_id → mosaic pickle, load both, generate the figure
-    with `visualize_selected_patches_slide`, and write each page into a PDF.
-    Splits into multiple PDF files if there are more than `max_per_file` slides.
+    Iterate over every slide_id → mosaic pickle, generate each visualization
+    (simple or extensive) and write them as pages in one or more PDFs,
+    using Pillow’s multi‐page PDF save.
 
     Args:
-        config (dict):
-            Experiment configuration dictionary.
-        all_data (sf.Dataset):
-            Slideflow dataset object providing TFRecord file paths.
-        slide_mosaic_paths (dict[str,str]):
-            Mapping slide_id → path to mosaic‐pickle.
-        mosaic_method (str):
-            Method name used for labeling in the titles.
-        pdf_path (str):
-            Base path (no extension) where output PDF(s) will be saved.
-            If more than `max_per_file` slides, files will be named
-            `{pdf_path}_part1.pdf`, `{pdf_path}_part2.pdf`, etc.
-        patch_size (int, optional):
-            Side length of each patch in pixels (defaults to first tile_px).
-        max_per_file (int):
-            Maximum number of slides (i.e. pages) per PDF. Default = 200.
+        config:             Experiment configuration dict.
+        all_data:           slideflow.Project or Dataset for locating slides.
+        slide_mosaic_paths: Mapping slide_id → path to mosaic .pkl.
+        mosaic_method:      Name of the patch‐selection method.
+        pdf_base:           Base path (no extension) for output PDF(s).
+                            E.g. "/path/to/reports/patch_report"
+        max_per_file:       Maximum slides per PDF.
     """
-    # If patch_size wasn’t given, infer from config
-    if patch_size is None:
-        px_list = config['benchmark_parameters']['tile_px']
-        patch_size = px_list[0] if isinstance(px_list, (list, tuple)) else px_list
+    # --- collect all composites up front ---
+    composites = []
+    slide_ids  = []
+    # detect which mode to use
+    vizs      = config.get("visualization", [])
+    patch_vis = [v for v in vizs if v.startswith("patch_selection-")]
+    if not patch_vis:
+        logging.info("No patch_selection method specified; defaulting to 'simple'")
+        mode = "simple"
+    else:
+        mode = patch_vis[0].split("-",1)[1]
+        if mode not in ("simple","extensive"):
+            logging.warning(f"Unknown patch_selection mode '{mode}', defaulting to simple")
+            mode = "simple"
 
-    # Gather all slide IDs in a list so we can slice into chunks of 200
-    all_items = list(slide_mosaic_paths.items())
-    total_slides = len(all_items)
-    if total_slides == 0:
-        logging.warning("No slides found in slide_mosaic_paths → nothing to visualize.")
-        return
+    for slide_id, mosaic_pkl in slide_mosaic_paths.items():
+        slide_path = all_data.find_slide(slide=slide_id)
+        if slide_path is None:
+            logging.warning(f"Slide not found: {slide_id}")
+            continue
 
-    # Compute how many “parts” (PDFs) we need
-    num_parts = math.ceil(total_slides / max_per_file)
+        mosaics_folder = os.path.dirname(mosaic_pkl)
 
-    for part_idx in range(num_parts):
-        # Determine slice boundaries:
-        start = part_idx * max_per_file
-        end = min(start + max_per_file, total_slides)
-        chunk = all_items[start:end]
+        # generate the composite PIL image
+        if mode == "simple":
+            img = visualize_selected_patches_simple(
+                config=config,
+                slide_id=slide_id,
+                slide_path=slide_path,
+                mosaics_folder=mosaics_folder,
+            )
+        else:
+            img = visualize_selected_patches_extensive(
+                config=config,
+                slide_id=slide_id,
+                slide_path=slide_path,
+                mosaics_folder=mosaics_folder, 
+                patch_px=patch_px,
+                patch_um=patch_um
+            )
+        if img is None:
+            logging.warning(f"Visualization failed for {slide_id}")
+            continue
 
-        # Build a filename for this chunk:
-        if num_parts == 1:
+        composites.append(img.convert("RGB"))
+        slide_ids.append(slide_id)
+
+    titled_composites = []
+    for img, slide_id in zip(composites, slide_ids):
+        title = f"{slide_id} - {mosaic_method}"
+        # you can tweak bar_height, font_scale, thickness here if you like
+        titled = add_title(
+            img,
+            title,
+        )
+        titled_composites.append(titled)
+
+    # now `titled_composites` replaces `composites` below
+    total = len(titled_composites)
+    parts = math.ceil(total / max_per_file)
+    for part in range(parts):
+        start = part * max_per_file
+        end   = min(start + max_per_file, total)
+        chunk_imgs = titled_composites[start:end]
+
+        if parts == 1:
             out_pdf = f"{pdf_base}.pdf"
         else:
-            out_pdf = f"{pdf_base}_part{part_idx+1}.pdf"
+            out_pdf = f"{pdf_base}_part{part+1}.pdf"
 
-        logging.debug(f"Writing slides {start}–{end-1} (of {total_slides}) to {out_pdf}")
+        os.makedirs(os.path.dirname(out_pdf), exist_ok=True)
+        first, rest = chunk_imgs[0], chunk_imgs[1:]
+        first.save(
+            out_pdf,
+            format="PDF",
+            save_all=True,
+            append_images=rest,
+            resolution=100
+        )
+        logging.info(f"Wrote slides {start+1}-{end} → {out_pdf}")
 
-        # Open a PdfPages for this chunk
-        with PdfPages(out_pdf) as pdf:
-            for slide_id, mosaic_pkl in chunk:
-                # Attempt to find the slide’s filesystem path:
-                slide_path = all_data.find_slide(slide=slide_id)
-                if slide_path is None:
-                    logging.warning(f"Slide path not found for slide ID: {slide_id}")
-                    continue
-
-                # Load the “mosaic” dictionary (patch indices + TFRecord path)
-                try:
-                    mosaic_data = load_patch_dicts_pickle(mosaic_pkl)
-                except Exception as e:
-                    logging.warning(f"Failed to load mosaic for {slide_id}: {e}")
-                    continue
-
-                # Produce the figure (thumbnail + patch grid) via your existing helper
-                fig = visualize_selected_patches_slide(
-                    slide_id=slide_id,
-                    slide_path=slide_path,
-                    mosaic_data=mosaic_data,
-                    method=mosaic_method,
-                    patch_size=patch_size
-                )
-                if fig is None:
-                    continue
-
-                # Rasterize every image in the figure so the PDF stays small
-                for ax in fig.axes:
-                    for im in ax.get_images():
-                        im.set_rasterized(True)
-
-                # Save this page to the current PDF at 80 dpi
-                pdf.savefig(fig, dpi=80, bbox_inches='tight')
-                plt.close(fig)
-
-        logging.debug(f"Completed writing {out_pdf}")
-
-    logging.debug(f"All done. Created {num_parts} PDF file(s).")
-
-"""def generate_extensive_patch_selection_report_pdf(
+"""def generate_patch_selection_report_pdf(
     config,
     all_data,
     slide_mosaic_paths,
     mosaic_method,
-    pdf_path,
-    patch_size=None
+    pdf_base,
+    max_per_file=200
 ):
+
+    # split into chunks
+    all_items = list(slide_mosaic_paths.items())
+    total     = len(all_items)
+    if total == 0:
+        logging.warning("No slides to visualize.")
+        return
+
+    parts = math.ceil(total / max_per_file)
+
+    # choose simple vs extensive
+    vizs = config.get("visualization", [])
+    patch_vis = [v for v in vizs if v.startswith("patch_selection-")]
+
+    if not patch_vis:
+        logging.info("No patch_selection method specified; defaulting to 'simple'")
+        chosen = "simple"
+    elif len(patch_vis) > 1:
+        logging.warning(f"Multiple patch_selection entries found ({patch_vis}); using first one")
+        chosen = patch_vis[0].split("-", 1)[1]
+    else:
+        chosen = patch_vis[0].split("-", 1)[1]
+
+    # validate
+    if chosen not in PATCH_VIS_METHODS:
+        logging.warning(f"Unknown patch_selection method '{chosen}'; defaulting to 'simple'")
+        chosen = "simple"
+
+    for pi in range(parts):
+        start = pi * max_per_file
+        end = min(start + max_per_file, total)
+        chunk = all_items[start:end]
+
+        if parts == 1:
+            out_pdf = f"{pdf_base}.pdf"
+        else:
+            out_pdf = f"{pdf_base}_part{pi+1}.pdf"
+
+        logging.info(f"Writing slides {start+1}-{end} → {out_pdf}")
+        os.makedirs(os.path.dirname(out_pdf), exist_ok=True)
+
+        with PdfPages(out_pdf) as pdf:
+            for slide_id, mosaic_pkl in chunk:
+                # locate slide file
+                slide_path = all_data.find_slide(slide=slide_id)
+                if slide_path is None:
+                    logging.warning(f"Slide not found: {slide_id}")
+                    continue
+
+                # compute dataset & roi folder from config
+                ds_name   = get_dataset_name_for_slide(config, slide_path)
+                roi_folder= get_path_from_dataset(config, ds_name, 'roi_path')
+                mosaics_folder = os.path.dirname(mosaic_pkl)
+
+                # call appropriate visualizer
+                if chosen == "simple":
+                    img = visualize_selected_patches_simple(
+                        slide_id=slide_id,
+                        slide_path=slide_path,
+                        mosaics_folder=mosaics_folder,
+                        roi_folder=roi_folder
+                    )
+                else:
+                    img = visualize_selected_patches_extensive(
+                        slide_id=slide_id,
+                        slide_path=slide_path,
+                        mosaics_folder=mosaics_folder,
+                        roi_folder=roi_folder
+                    )
+
+                if img is None:
+                    logging.warning(f"Visualization failed for {slide_id}")
+                    continue
+
+                # convert PIL image → numpy array
+                arr = np.array(img)
+                h, w = arr.shape[:2]
+                dpi = 100
+
+                # create a matplotlib figure just to embed into PDF
+                fig = plt.figure(figsize=(w/dpi, h/dpi), dpi=dpi)
+                plt.axis("off")
+                plt.imshow(arr)
+                plt.title(f"Slide: {slide_id}, Method: {mosaic_method}", y=1.02, fontsize=16)
+                pdf.savefig(fig, bbox_inches='tight', pad_inches=0.1)
+                plt.close(fig)
+
+        logging.info(f"Saved {out_pdf}")"""
+
+"""def visualize_selected_patches_simple(slide_id, slide_path, mosaics_folder, roi_folder):
+    # ---- Paths ----
+    mosaic_path = os.path.join(mosaics_folder, f"{slide_id}.pkl")
+    roi_path    = os.path.join(roi_folder, f"{slide_id}.csv")
+
+    # ---- Build ROI-cropped thumbnail ----
+    roi_geom = load_qupath_rois(roi_path)
+    minx, miny, maxx, maxy = roi_geom.bounds
+    width, height = maxx - minx, maxy - miny
+
+    slide = OpenSlide(slide_path)
+    level, _ = find_best_level(slide, MAX_THUMB_SIZE)
+    downsample = slide.level_downsamples[level]
+
+    # Read the ROI at the chosen level
+    lvl_w = int(width  / downsample)
+    lvl_h = int(height / downsample)
+    crop = slide.read_region((int(minx), int(miny)), level, (lvl_w, lvl_h)).convert("RGB")
+
+    # Scale to fit square
+    scale = min(MAX_THUMB_SIZE / lvl_w, MAX_THUMB_SIZE / lvl_h)
+    tw, th = int(lvl_w * scale), int(lvl_h * scale)
+    crop = crop.resize((tw, th), Image.BILINEAR)
+
+    # Center into square canvas
+    thumb_canvas = Image.new("RGB", (MAX_THUMB_SIZE, MAX_THUMB_SIZE), (255,255,255))
+    ox = (MAX_THUMB_SIZE - tw) // 2
+    oy = (MAX_THUMB_SIZE - th) // 2
+    thumb_canvas.paste(crop, (ox, oy))
+
+    draw = ImageDraw.Draw(thumb_canvas)
+    draw.rectangle(
+        [BORDER_WIDTH//2, BORDER_WIDTH//2,
+        MAX_THUMB_SIZE - BORDER_WIDTH//2 - 1,
+        MAX_THUMB_SIZE - BORDER_WIDTH//2 - 1],
+        outline="black",
+        width=BORDER_WIDTH
+    )
+
+    # ---- Load selected patches ---- 
+    patch_data = load_patch_dicts_pickle(mosaic_path, reconstruct_features=False)
+    tfr_path   = patch_data["properties"]["tfr_path"]
+    tfr        = sf.TFRecord(tfr_path)
+
+    patch_images = []
+    for p in patch_data["patches"]:
+        rec = tfr[p["tfr_index"]]
+        img = sf.io.decode_image(bytes(rec["image_raw"]))
+        patch_images.append(Image.fromarray(np.array(img)))
+
+    # ---- Build composite canvas with grid of patches below the thumbnail ----
+    n = len(patch_images)
+    rows = math.ceil(n / GRID_COLS)
+    total_height = MAX_THUMB_SIZE + rows * VIS_PATCH_SIZE
+
+    composite = Image.new("RGB", (MAX_THUMB_SIZE, total_height), (255,255,255))
+    composite.paste(thumb_canvas, (0,0))
+
+    for i, img in enumerate(patch_images):
+        r, c = divmod(i, GRID_COLS)
+        composite.paste(img, (c*VIS_PATCH_SIZE, MAX_THUMB_SIZE + r*VIS_PATCH_SIZE))
+
+    # ---- Annotate thumbnail with fixed-size squares + centered indices ----
+    cv_img = cv2.cvtColor(np.array(composite), cv2.COLOR_RGB2BGR)
+
+    # Precompute thumbnail scaling factors
+    scale_x = tw / width
+    scale_y = th / height
+
+    # Draw each patch marker on the thumbnail
+    for idx, p in enumerate(patch_data["patches"]):
+        x_full, y_full = p["loc"]
+
+        # Map full-resolution coordinates → thumbnail canvas coords
+        dx = int((x_full - minx) * scale_x + ox)
+        dy = int((y_full - miny) * scale_y + oy)
+
+        # Draw the standardized square
+        pt1 = (dx, dy)
+        pt2 = (dx + MARKER_PX, dy + MARKER_PX)
+        cv2.rectangle(cv_img, pt1, pt2, color=(0,0,0), thickness=-1)
+
+        # Center the index text in that square
+        text = str(idx)
+        font       = cv2.FONT_HERSHEY_SIMPLEX
+        fontScale  = 1.0
+        thickness  = 2
+        (tw_txt, th_txt), baseline = cv2.getTextSize(text, font, fontScale, thickness)
+        text_x = dx + (MARKER_PX - tw_txt) // 2
+        text_y = dy + (MARKER_PX + th_txt) // 2
+        cv2.putText(
+            cv_img,
+            text,
+            (text_x, text_y),
+            font,
+            fontScale,
+            (255,255,255),
+            thickness,
+            lineType=cv2.LINE_AA
+        )
+
+    # ---- Annotate the patches grid below with their indices (optional repeat) ----
+    for i in range(n):
+        r, c = divmod(i, GRID_COLS)
+        org = (c*VIS_PATCH_SIZE + 5, MAX_THUMB_SIZE + r*VIS_PATCH_SIZE + int(VIS_PATCH_SIZE*0.2))
+        cv2.putText(
+            cv_img,
+            str(i),
+            org,
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=1.0,
+            color=(0,0,0),
+            thickness=2,
+            lineType=cv2.LINE_AA
+        )
+
+    # 6) Convert back to PIL and display/save
+    composite = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
     
-    Iterate over every slide_id → mosaic pickle, load both, generate the figure
-    with `visualize_selected_patches_slide`, and write each page into a single PDF.
-    By rasterizing each axes and saving at a low DPI, the final PDF is much smaller.
+    return composite"""
 
-    # Derive patch_size from config if not given
-    if patch_size is None:
-        px_list = config['benchmark_parameters']['tile_px']
-        patch_size = px_list[0] if isinstance(px_list, (list, tuple)) else px_list
+"""def get_path_from_dataset(config: Dict, dataset_name: str, path: str) -> str:
+    for ds in config.get("datasets", []):
+        if ds.get("name") == dataset_name:
+            roi = ds.get(path)
+            if roi:
+                return os.path.abspath(roi)
+            else:
+                raise KeyError(f"Dataset '{dataset_name}' has no roi_path defined.")
+    raise KeyError(f"No dataset named '{dataset_name}' in config.")"""
 
-    with PdfPages(pdf_path) as pdf:
-        for slide_id, mosaic_pkl in slide_mosaic_paths.items():
-            slide_path = all_data.find_slide(slide=slide_id)
-            if slide_path is None:
-                logging.warning(f"Slide path not found for slide ID: {slide_id}")
-                continue
 
-            # Load the “mosaic” dictionary (patch indices + TFRecord path)
-            try:
-                mosaic_data = load_patch_dicts_pickle(mosaic_pkl)
-            except Exception as e:
-                logging.warning(f"Failed to load mosaic for {slide_id}: {e}")
-                continue
+"""def visualize_selected_patches_extensive(slide_id, slide_path, mosaics_folder, roi_folder, patch_px, patch_um):
 
-            fig = visualize_selected_patches_slide(
-                slide_id=slide_id,
-                slide_path=slide_path,
-                mosaic_data=mosaic_data,
-                method=mosaic_method,
-                patch_size=patch_size
-            )
-            if fig is None:
-                continue
+    # ---- Paths ----
+    mosaic_path = os.path.join(mosaics_folder, f"{slide_id}.pkl")
+    mosaic_patch_ids_path = os.path.join(mosaics_folder, f"{slide_id}.npz")
+    roi_path = os.path.join(roi_folder,    f"{slide_id}.csv")
 
-            # Make sure **all** image artists get rasterized (thumbnail & patches)
-            for ax in fig.axes:
-                for im in ax.get_images():
-                    im.set_rasterized(True)
+    # ---- Build ROI‐cropped thumbnail ---- 
+    roi_geom = load_qupath_rois(roi_path)
+    minx, miny, maxx, maxy = roi_geom.bounds
+    width, height = maxx - minx, maxy - miny
 
-            pdf.savefig(fig, dpi=80, bbox_inches='tight')
-            plt.close(fig)
+    slide = OpenSlide(slide_path)
+    level, _ = find_best_level(slide, MAX_THUMB_SIZE)
+    downsample = slide.level_downsamples[level]
 
-    logging.info(f"Saved multi‐page PDF of patch visualizations to: {pdf_path}")"""
+    slide_mpp = float(
+        slide.properties.get("openslide.mpp-x",
+        slide.properties.get("tiff_mpp_x", 1.0))
+    )
 
-##########################################################################################################################################################
-##########################################################################################################################################################
+    # --- 3) Compute full-res pixel size of each patch box ---
+    extraction_mpp   = patch_um / patch_px            # µm per pixel at extraction
+    scale_factor     = extraction_mpp / slide_mpp     # how extraction‐MPP compares to slide‐MPP
+    fullres_patch_px = int(round(patch_px * scale_factor))
 
-"""def generate_patch_selection_report_pdf(
-    config: dict,
-    all_data,
-    slide_mosaic_paths: dict,
-    pdf_path: str,
-    patch_size: int,
-    thumb_size: int = 512,
-    overview_grid: tuple = (2, 3),
-    num_detail_patches: int = 10
-) -> None:
+    lvl_w = int(width  / downsample)
+    lvl_h = int(height / downsample)
+    crop = slide.read_region((int(minx), int(miny)), level, (lvl_w, lvl_h)).convert("RGB")
 
-    tile_px = config["benchmark_parameters"]["tile_px"]
-    tile_size = tile_px[0] if isinstance(tile_px, (list, tuple)) else tile_px
+    scale = min(MAX_THUMB_SIZE / lvl_w, MAX_THUMB_SIZE / lvl_h)
+    tw, th = int(lvl_w * scale), int(lvl_h * scale)
+    crop = crop.resize((tw, th), Image.BILINEAR)
 
-    slide_ids = list(slide_mosaic_paths.keys())
-    os.makedirs(os.path.dirname(pdf_path), exist_ok=True)
+    base_thumb = Image.new("RGB", (MAX_THUMB_SIZE, MAX_THUMB_SIZE), (255,255,255))
+    ox = (MAX_THUMB_SIZE - tw)//2
+    oy = (MAX_THUMB_SIZE - th)//2
+    base_thumb.paste(crop, (ox, oy))
+    base_cv = cv2.cvtColor(np.array(base_thumb), cv2.COLOR_RGB2BGR)
 
-    with PdfPages(pdf_path) as pdf:
-        visualize_patch_selection_overview(
-            pdf,
-            all_data,
-            slide_ids,
-            slide_mosaic_paths,
-            thumb_size=thumb_size,
-            tile_size=patch_size
+    # Precompute scaling
+    scale_x = tw / width
+    scale_y = th / height
+
+    # Prepare two annotated thumbnails
+    thumb_bin = base_cv.copy()
+    thumb_idx = base_cv.copy()
+
+    # ---- Annotate thumb_bin with colored bin overlays + legend ----
+
+    # Load bin data
+    bin_data     = np.load(mosaic_patch_ids_path)
+    bin_ids      = bin_data['bin_ids']
+    coords       = bin_data['coords']
+    merged_polys = merge_patch_polygons_by_bin(coords, bin_ids, fullres_patch_px)
+
+    overlay     = thumb_bin.copy()
+    unique_bins = sorted(merged_polys.keys())
+
+    unique_bins = sorted(merged_polys.keys())
+    palette = generate_distinct_bgr_colors(len(unique_bins))
+
+    for i, bin_id in enumerate(unique_bins):
+        color = palette[i % len(palette)]
+        poly  = merged_polys[bin_id]
+        geoms = [poly] if isinstance(poly, Polygon) else poly.geoms
+        for geom in geoms:
+            pts = [
+                [int((x - minx)*scale_x + ox), int((y - miny)*scale_y + oy)]
+                for x,y in geom.exterior.coords
+            ]
+            pts = np.array(pts, np.int32).reshape((-1,1,2))
+            cv2.fillPoly(overlay, [pts], color)
+            cv2.polylines(overlay, [pts], True, color, 2)
+    thumb_bin = cv2.addWeighted(overlay, PATCH_ALPHA, thumb_bin, 1-PATCH_ALPHA, 0)
+
+    # legend inside thumb_bin
+    # compute text width for safety
+    max_text_width = max(
+        cv2.getTextSize(f"bin {b}", FONT, 1.0, 2)[0][0] 
+        for b in unique_bins
+    )
+
+    # right-side, vertically centered
+    legend_x = MAX_THUMB_SIZE - LEGEND_MARGING - SWATCH_SIZE - max_text_width - 10
+    total_legend_height = len(unique_bins)*SWATCH_SIZE + (len(unique_bins)-1)*SWATCH_PAD
+    legend_y = (MAX_THUMB_SIZE - total_legend_height) // 2
+
+    for i, bin_id in enumerate(unique_bins):
+        color = palette[i % len(palette)]
+        y0    = legend_y + i*(SWATCH_SIZE + SWATCH_PAD)
+        # swatch
+        cv2.rectangle(
+            thumb_bin,
+            (legend_x, y0),
+            (legend_x + SWATCH_SIZE, y0 + SWATCH_PAD),
+            color, -1
+        )
+        # label
+        cv2.putText(
+            thumb_bin,
+            f"bin {bin_id}",
+            (legend_x + SWATCH_SIZE + 5, y0 + SWATCH_SIZE - 5),
+            FONT, 1.0, (0,0,0), 2, cv2.LINE_AA
         )
 
-        visualize_patch_selection_details(
-            pdf,
-            slide_ids,
-            slide_mosaic_paths,
-            num_patches=num_detail_patches,
-            patch_size=tile_size
-        )
+    # ---- Annotate thumb_idx with patch markers + centered indices ----
+    patch_data = load_patch_dicts_pickle(mosaic_path, reconstruct_features=False)
+    for idx, p in enumerate(patch_data["patches"]):
+        x_full, y_full = p["loc"]
+        dx = int((x_full - minx)*scale_x + ox)
+        dy = int((y_full - miny)*scale_y + oy)
+        cv2.rectangle(thumb_idx, (dx, dy), (dx+MARKER_PX, dy+MARKER_PX), (0,0,0), -1)
+        txt = str(idx)
+        (w,h),_ = cv2.getTextSize(txt, FONT, 1.0, 2)
+        tx = dx + (MARKER_PX-w)//2
+        ty = dy + (MARKER_PX+h)//2
+        cv2.putText(thumb_idx, txt, (tx, ty), FONT, 1.0, (255,255,255), 2, cv2.LINE_AA)
 
-    logging.info(f"Combined PDF report written to: {pdf_path}")"""
+    # ---- Load patch images ----
+    patch_data   = load_patch_dicts_pickle(mosaic_path, reconstruct_features=False)
+    tfr_path     = patch_data["properties"]["tfr_path"]
+    tfr          = sf.TFRecord(tfr_path)
+    patch_images = []
+    for p in patch_data["patches"]:
+        rec = tfr[p["tfr_index"]]
+        img = sf.io.decode_image(bytes(rec["image_raw"]))
+        patch_images.append(Image.fromarray(np.array(img)))
 
+    # ---- Composite: two thumbs side-by-side + full-width grid ----
+    patch_grid_cols = GRID_COLS * 2
+    n               = len(patch_images)
+    rows            = math.ceil(n / patch_grid_cols)
+    total_h         = MAX_THUMB_SIZE + rows * VIS_PATCH_SIZE
+    composite       = Image.new("RGB", (2*MAX_THUMB_SIZE, total_h), (0,0,0))
 
+    # ---- Add borders ----
+    cv2.rectangle(
+        thumb_bin,
+        (0, 0),
+        (MAX_THUMB_SIZE-1, MAX_THUMB_SIZE-1),
+        color=(0, 0, 0),
+        thickness=BORDER_WIDTH
+    )
+    cv2.rectangle(
+        thumb_idx,
+        (0, 0),
+        (MAX_THUMB_SIZE-1, MAX_THUMB_SIZE-1),
+        color=(0, 0, 0),
+        thickness=BORDER_WIDTH
+    )
+
+    # ---- paste thumbs ----
+    composite.paste(Image.fromarray(cv2.cvtColor(thumb_bin, cv2.COLOR_BGR2RGB)), (0,0))
+    composite.paste(Image.fromarray(cv2.cvtColor(thumb_idx, cv2.COLOR_BGR2RGB)),
+                    (MAX_THUMB_SIZE,0))
+
+    # paste patch grid
+    for i, img in enumerate(patch_images):
+        r, c = divmod(i, patch_grid_cols)
+        x    = c * VIS_PATCH_SIZE
+        y    = MAX_THUMB_SIZE + r * VIS_PATCH_SIZE
+        composite.paste(img, (x, y))
+
+    # ---- Annotate grid patches with their indices ----
+    cv_img = cv2.cvtColor(np.array(composite), cv2.COLOR_RGB2BGR)
+    for i in range(n):
+        r, c = divmod(i, patch_grid_cols)
+        x = c * VIS_PATCH_SIZE
+        y = MAX_THUMB_SIZE + r * VIS_PATCH_SIZE
+        org = (x + 5, y + int(VIS_PATCH_SIZE*0.15))
+        cv2.putText(cv_img, str(i), org, FONT, 1.0, (0,0,0), 2, cv2.LINE_AA)
+
+    # ---- Convert back to PIL and display ----
+    composite = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+    
+    return composite"""
