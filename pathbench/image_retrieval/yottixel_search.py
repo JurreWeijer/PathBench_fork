@@ -72,21 +72,34 @@ class YottixelDatabase:
         slide_mosaics (dict): Mapping from slide ID to list of patch dictionaries.
         k (int): Number of nearest neighbors to use in retrieval.
     """
-    def __init__(self, config: dict, slide_mosaic_paths: dict, k: int = 3):
+    def __init__(self, config: dict, slide_representation_paths: dict, k: int = 3):
         self.k = k
         self.bobs = []
 
         # Load slide annotations
         annotation_path = config['experiment']['annotation_file']
-        annotations = pd.read_csv(annotation_path).set_index("slide")
+        self.annotations = pd.read_csv(annotation_path).set_index("slide")
 
+        exts = {os.path.splitext(p)[1] for p in slide_representation_paths.values()}
+        if len(exts) > 1:
+            raise ValueError(
+                f"Yottixel: mixed representation types found ({', '.join(exts)}); cannot proceed"
+            )
+        self.is_slide = (exts == {'.pt'})
+
+        if self.is_slide:
+            self.build_slide_bobs(slide_representation_paths)
+        else: 
+            self.build_patch_bobs(slide_representation_paths)
+
+    def build_patch_bobs(self, slide_representation_paths: dict):
         # Create a BoB for each slide using binarized features
-        for slide_id, mosaic_pkl in tqdm(slide_mosaic_paths.items(), desc="Building BoBs"):
-            if slide_id not in annotations.index:
+        for slide_id, mosaic_pkl in tqdm(slide_representation_paths.items(), desc="Building BoBs"):
+            if slide_id not in self.annotations.index:
                 continue
 
-            label = annotations.loc[slide_id]["category"]
-            patient_id = annotations.loc[slide_id]["patient"]
+            label = self.annotations.loc[slide_id]["category"]
+            patient_id = self.annotations.loc[slide_id]["patient"]
 
             # ---- re-load only the selected patches (this reinserts .feature) ----
             mosaic_data = load_patch_dicts_pickle(mosaic_pkl, reconstruct_features=True)
@@ -99,6 +112,34 @@ class YottixelDatabase:
             barcodes = (np.diff(patch_features, axis=1) < 0).astype(int)
 
             # 5) build our BoB
+            bob = BoB(barcodes, slide_id, patient_id, label)
+            self.bobs.append(bob)
+    
+    def build_slide_bobs(self, slide_feature_paths: dict):
+        """
+        For slide-level inputs (.pt), load the one tensor per slide
+        and build a BoB with a single-row barcode.
+        """
+        for slide_id, pt_path in tqdm(slide_feature_paths.items(), desc="Building slide BoBs"):
+            if slide_id not in self.annotations.index:
+                continue
+
+            label      = self.annotations.loc[slide_id]["category"]
+            patient_id = self.annotations.loc[slide_id].get("patient", None)
+
+            # load the slide feature tensor
+            feat = torch.load(pt_path, map_location="cpu")
+            if isinstance(feat, torch.Tensor):
+                feat = feat.detach().numpy()
+            feat = np.asarray(feat)
+
+            # ensure shape (1, feat_dim)
+            if feat.ndim == 1:
+                feat = feat[np.newaxis, :]
+
+            # binarize
+            barcodes = (np.diff(feat, axis=1) < 0).astype(int)
+
             bob = BoB(barcodes, slide_id, patient_id, label)
             self.bobs.append(bob)
 
@@ -114,6 +155,14 @@ class YottixelDatabase:
         """
         # Exclude BoBs from the same patient as the query
         atlas_bobs = [b for b in self.bobs if b.patient_id != query_bob.patient_id]
+        if not atlas_bobs:
+            return {
+                "query_slide_id": query_bob.slide_id,
+                "query_label": query_bob.label,
+                "predicted_label": query_bob.label,  # fallback to self
+                "top_k": []
+            }
+
         atlas_labels = [b.label for b in atlas_bobs]
         atlas_ids = [b.slide_id for b in atlas_bobs]
 

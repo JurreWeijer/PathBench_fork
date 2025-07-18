@@ -1,6 +1,6 @@
 from slideflow import mil
 from slideflow.model.extractors._factory_torch import TorchFeatureExtractor
-from slideflow.model.extractors import register_torch
+from slideflow.model.extractors import register_torch, register_tf
 from torchvision.models.resnet import Bottleneck, ResNet
 import torch
 import torch.nn as nn
@@ -2774,7 +2774,7 @@ class titan_slide(SlideFeatureExtractor):
             'kwargs': {}
         }
 
-@register_torch
+@register_tf
 class prism_slide(SlideFeatureExtractor):
     """
     PRISM feature extractor, with Vision Transformer backbone

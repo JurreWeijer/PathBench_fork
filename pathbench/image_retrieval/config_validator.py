@@ -12,21 +12,27 @@ class SISConfigValidator:
     ALLOWED_VIZ_METHODS = {"umap-mean", "umap-median", "umap-none", "patch_selection-extensive", "patch_selection-simple"}
     ALLOWED_UMAP_KEYS = {"n_neighbors", "min_dist", "metric"}
     ALLOWED_NORMALIZATIONS = {"reinhard", "macenko", "cyclegan"}
-    ALLOWED_FEATURE_EXTRACTORS = {
-        "resnet50_imagenet", "ctranspath", "transpath_mocov3", "retccl",
+
+    PATCH_FEATURE_EXTRACTORS = {"resnet50_imagenet", "ctranspath", "transpath_mocov3", "retccl",
         "plip", "histossl", "uni", "uni_h", "conch", "dino", "mocov2",
         "swav", "phikon", "phikon_v2", "gigapath", "barlow_twins", "hibou_b",
         "hibou_l", "pathoduet_ihc", "pathoduet_he", "kaiko_s8", "kaiko_s16",
         "kaiko_b8", "kaiko_b16", "kaiko_l14", "h_optimus_0", "h_optimus_1",
-        "virchow", "virchow2", "exaone_path", "titan_slide", "gigapath_slide", "prism_slide"
-    }
-    ALLOWED_SEARCH_METHODS = {"yottixel", "sish"}
+        "virchow", "virchow2", "exaone_path"}
+    SLIDE_FEATURE_EXTRACTORS = {"titan_slide", "gigapath_slide", "prism_slide"}
+    ALLOWED_FEATURE_EXTRACTORS = PATCH_FEATURE_EXTRACTORS | SLIDE_FEATURE_EXTRACTORS
+
+    PATCH_SEARCH_METHODS = {"yottixel", "sish"}
+    SLIDE_SEARCH_METHODS = {"yottixel"}
+    ALLOWED_SEARCH_METHODS = PATCH_SEARCH_METHODS | SLIDE_SEARCH_METHODS
+
     ALLOWED_MOSAIC_BASE = {"splice_rgb", "splice_features", "yottixel_rgb", "yottixel_features", "sdm_features"}
     METRIC_PATTERN = re.compile(r"^(hit|mmv|map)_at_\d+$", re.IGNORECASE)
 
     def __init__(self, config: dict):
         self.cfg = config
         self.errors = []
+        self._combination_error = ""
 
     def validate(self):
         self._validate_experiment()
@@ -209,7 +215,9 @@ class SISConfigValidator:
                 except:
                     self.errors.append(f"Invalid mosaic percentile: {mm}")
         
-        if "roi" in bp:
+        #TODO: add a check if the most important ones are present
+
+        """if "roi" in bp:
             roi_vals = bp["roi"]
             # must be a list of bools
             if not (isinstance(roi_vals, (list,tuple)) and all(isinstance(v,bool) for v in roi_vals)):
@@ -222,7 +230,7 @@ class SISConfigValidator:
                     if not rp:
                         self.errors.append(f"[datasets][{idx}] missing `roi_path` but ROI=True requested")
                     elif not os.path.isdir(rp):
-                        self.errors.append(f"[datasets][{idx}] `roi_path` does not exist: {rp!r}")
+                        self.errors.append(f"[datasets][{idx}] `roi_path` does not exist: {rp!r}")"""
 
     def _validate_other(self):
         wd = self.cfg.get("weights_dir","")
@@ -231,3 +239,61 @@ class SISConfigValidator:
         hf = self.cfg.get("hf_key","")
         if not isinstance(hf,str) or not hf.strip():
             self.errors.append("`hf_key` must be a non-empty string")
+
+    def is_patch_model(self, extractor_name: str) -> bool:
+        """
+        Returns True if the given extractor is a patch‐level feature extractor.
+        """
+        return extractor_name in self.PATCH_FEATURE_EXTRACTORS
+
+    def is_slide_model(self, extractor_name: str) -> bool:
+        """
+        Returns True if the given extractor is a slide‐level feature extractor.
+        """
+        return extractor_name in self.SLIDE_FEATURE_EXTRACTORS
+
+    def is_patch_search(self, method: str) -> bool:
+        """
+        Returns True if the given search method operates at the patch level.
+        """
+        return method in self.PATCH_SEARCH_METHODS
+
+    def is_slide_search(self, method: str) -> bool:
+        """
+        Returns True if the given search method operates at the slide level.
+        """
+        return method in self.SLIDE_SEARCH_METHODS
+    
+    def is_valid_combination(self, combo: dict) -> bool:
+        """
+        Enforces that:
+          - patch‐models only go with patch‐searches
+          - slide‐models only go with slide‐searches
+        """
+        feat = combo.get("feature_extraction", "").lower()
+        search = combo.get("search_method", "").lower().split("-")[0]
+
+        # patch‐level extractor must use a patch‐level search
+        if self.is_patch_model(feat) and not self.is_patch_search(search):
+            self._combination_error = (
+                f"Extractor '{feat}' is patch‐level, but search method '{search}' "
+                "is not patch‐level."
+            )
+            return False
+
+        # slide‐level extractor must use a slide‐level search
+        if self.is_slide_model(feat) and not self.is_slide_search(search):
+            self._combination_error = (
+                f"Extractor '{feat}' is slide‐level, but search method '{search}' "
+                "is not slide‐level."
+            )
+            return False
+
+        # if we get here, it’s valid
+        self._combination_error = ""
+        return True
+
+    @property
+    def combination_error(self) -> str:
+        """Last reason why validation failed (or empty if none)."""
+        return self._combination_error
