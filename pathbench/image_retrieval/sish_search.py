@@ -35,7 +35,7 @@ class SISHDatabase:
     def __init__(
         self,
         config: dict,
-        slide_mosaic_paths: Dict[str, str],
+        slide_representation_paths: Dict[str, str],
         k: int,
         mosaic_string: str
     ) -> None:
@@ -63,9 +63,16 @@ class SISHDatabase:
         """
         # ---- store parameters ----
         self.config = config
-        self.slide_mosaics = slide_mosaic_paths
+        self.slide_representations_paths = slide_representation_paths
         self.topk = k
         self.mosaic_string = mosaic_string
+
+        # Ensure we get patch-level information
+        exts = {os.path.splitext(p)[1] for p in slide_representation_paths.values()}
+        if len(exts) > 1:
+            raise ValueError(f"SISH: mixed representation types found ({exts}); cannot proceed")
+        if exts != {'.pt'}:
+            raise ValueError(f"SISH: expected patch-level representations (.pt), got {exts}")
 
         # ---- initialize in-memory structures ----
         self.meta = {}   # key:int -> List[meta-dict]
@@ -146,7 +153,7 @@ class SISHDatabase:
         logging.info("Reset metadata and key lists before index build.")
 
         # ---- iterate slides to populate keys + meta ----
-        for slide_id, mosaic_pkl in self.slide_mosaics.items():
+        for slide_id, mosaic_pkl in self.slide_representations_paths.items():
             label = self.annotations.at[slide_id, 'category']
             patient_id = self.annotations.at[slide_id, 'patient']
             logging.debug(f"Indexing slide {slide_id}: category={label}, patient={patient_id}")
@@ -621,7 +628,7 @@ class SISHDatabase:
         """
         # load or build index/meta…
         topk_results = []
-        for slide_id in self.slide_mosaics:
+        for slide_id in self.slide_representations_paths:
             patient_id = self.annotations.at[slide_id, 'patient']
             label      = self.annotations.at[slide_id, 'category']
 
