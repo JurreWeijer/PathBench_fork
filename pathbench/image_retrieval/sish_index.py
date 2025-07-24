@@ -47,7 +47,7 @@ def compute_latent_features(
 ) -> np.ndarray:
     ds = PatchTFRecordDataset(mosaic_pkl, transform)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=True)
+                        num_workers=num_workers, pin_memory=False, persistent_workers=False)
     all_latents = []
     vqvae.to(device).eval()
     with torch.no_grad():

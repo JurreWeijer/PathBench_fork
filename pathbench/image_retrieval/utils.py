@@ -407,3 +407,39 @@ def save_retrieval_results_to_excel(results, output_path):
     df = pd.DataFrame(rows)
     df.to_excel(output_path, index=False)
     logging.info(f"Saved retrieval results to: {output_path}")
+
+def log_mem(tag: str = ""):
+    import os, psutil
+    proc = psutil.Process(os.getpid())
+    rss = proc.memory_info().rss / 1e9
+    cuda_alloc = torch.cuda.memory_allocated() / 1e6 if torch.cuda.is_available() else 0
+    cuda_res   = torch.cuda.memory_reserved()  / 1e6 if torch.cuda.is_available() else 0
+    shm_used = 0.0
+    if os.path.exists("/dev/shm"):
+        try:
+            shm_used = psutil.disk_usage("/dev/shm").used / 1e9
+        except Exception:
+            pass
+    logging.info(f"[{tag}] RSS={rss:.2f} GB  CUDA alloc/res={cuda_alloc:.0f}/{cuda_res:.0f} MB  /dev/shm={shm_used:.2f} GB")
+
+def cleanup_dev_shm():
+    """Remove leaked POSIX shared memory/semaphore files created by this uid."""
+    import os, stat, getpass
+    base = "/dev/shm"
+    if not os.path.isdir(base):
+        return
+    uid = os.getuid()
+    for name in os.listdir(base):
+        path = os.path.join(base, name)
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            continue
+        # only touch our own stuff
+        if st.st_uid != uid:
+            continue
+        if name.startswith(("torch_", "pymp-", "mp.", "shm", "sem.")):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass

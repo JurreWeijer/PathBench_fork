@@ -6,6 +6,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
 import os
+import gc
+import psutil
 
 from ..image_retrieval.utils import load_patch_dicts_pickle
 
@@ -110,7 +112,7 @@ def run_umap_visualizations(config, slide_representation_paths, mosaic_method, o
     # flatten umap_parameters into a dict
     umap_params = { list(d.keys())[0]: list(d.values())[0] for d in config.get("umap_parameters",[]) }
 
-    vizs = config.get("visualization", [])
+    vizs = config["experiment"].get("visualization", [])
     aggs_methods = []
     for viz in vizs:
         if not viz.startswith("UMAP"):
@@ -144,4 +146,13 @@ def run_umap_visualizations(config, slide_representation_paths, mosaic_method, o
 
         logging.info(f"Saved UMAP to {output_path}")
         
-    
+    # ---- CLEANUP ----
+    # Drop large locals so GC can reclaim them
+    for name in ["X", "emb", "slide_feats", "slide_labels", "feats",
+                 "feats_raw", "data"]:
+        if name in locals():
+            del locals()[name]
+
+    gc.collect()
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()

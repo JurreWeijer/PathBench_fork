@@ -22,7 +22,7 @@ class SISConfigValidator:
     SLIDE_FEATURE_EXTRACTORS = {"titan_slide", "gigapath_slide", "prism_slide"}
     ALLOWED_FEATURE_EXTRACTORS = PATCH_FEATURE_EXTRACTORS | SLIDE_FEATURE_EXTRACTORS
 
-    PATCH_SEARCH_METHODS = {"yottixel", "sish"}
+    PATCH_SEARCH_METHODS = {"yottixel", "sish", "retccl"}
     SLIDE_SEARCH_METHODS = {"yottixel"}
     ALLOWED_SEARCH_METHODS = PATCH_SEARCH_METHODS | SLIDE_SEARCH_METHODS
 
@@ -134,7 +134,7 @@ class SISConfigValidator:
                 )
 
     def _validate_visualization(self):
-        viz = self.cfg.get("visualization", [])
+        viz = self.cfg["experiment"].get("visualization", [])
         if not isinstance(viz, list):
             self.errors.append("`visualization` must be a list")
             return

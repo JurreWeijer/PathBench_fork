@@ -17,6 +17,12 @@ import multiprocessing
 import logging
 import multiprocessing as mp
 from collections import Counter
+from torchvision import transforms
+import psutil, os, sys, gc
+import json
+from collections import defaultdict
+import torch.multiprocessing as mp
+mp.set_sharing_strategy('file_system')
 
 from ..image_retrieval.sish_index import min_max_binarized, compute_latent_features, slide_to_index
 from ..image_retrieval.sish_eval import Uncertainty_Cal, Clean, Filtered_BY_Prediction
@@ -25,6 +31,34 @@ from ..image_retrieval.sish_veb import VEB
 from ..image_retrieval.utils import load_patch_dicts_pickle
 
 logger = logging.getLogger(__name__)
+
+# must live at module scope so pickle can find it
+def scale_to_minus1_to_1(x):
+    """
+    Transform tensor values in [0,1] into [-1,1] for the VQ‑VAE.
+    """
+    return 2 * x - 1
+
+def hamming_bytes(a: bytes, b: bytes) -> int:
+    """Fast Hamming distance between two equal‑length byte strings."""
+    arr_a = np.frombuffer(a, dtype=np.uint64, count=len(a)//8)
+    arr_b = np.frombuffer(b, dtype=np.uint64, count=len(b)//8)
+    return int(sum(int(v).bit_count() for v in (arr_a ^ arr_b)))
+
+def log_mem(tag):
+    p = psutil.Process(os.getpid())
+    rss = p.memory_info().rss/1e9
+    kids = sum((c.memory_info().rss for c in p.children(recursive=True)
+                if c.is_running()), 0)/1e9
+    shm  = psutil.disk_usage('/dev/shm').used/1e9 if os.path.exists('/dev/shm') else 0
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated()/1e6
+        reserv= torch.cuda.memory_reserved()/1e6
+    else:
+        alloc = reserv = 0
+    logging.info(f"[{tag}] RSS={rss:.2f} GB  kids={kids:.2f} GB  "
+                 f"CUDA alloc/res={alloc:.0f}/{reserv:.0f} MB  /dev/shm={shm:.2f} GB")
+
 
 class SISHDatabase:
     """
@@ -71,8 +105,8 @@ class SISHDatabase:
         exts = {os.path.splitext(p)[1] for p in slide_representation_paths.values()}
         if len(exts) > 1:
             raise ValueError(f"SISH: mixed representation types found ({exts}); cannot proceed")
-        if exts != {'.pt'}:
-            raise ValueError(f"SISH: expected patch-level representations (.pt), got {exts}")
+        if exts != {'.pkl'}:
+            raise ValueError(f"SISH: expected patch-level representations (.pkl), got {exts}")
 
         # ---- initialize in-memory structures ----
         self.meta = {}   # key:int -> List[meta-dict]
@@ -107,7 +141,7 @@ class SISHDatabase:
             code_size=128
         )
         # transform: image tensor [0,1] -> [-1,1]
-        self.transform_vqvqe = transforms.Lambda(lambda x: 2 * x - 1)
+        self.transform_vqvqe = transforms.Lambda(scale_to_minus1_to_1)
 
         # ---- load encoder & codebook weights, stripping 'module.' prefix ----
         raw_checkpoint = torch.load(checkpoint_path)['model']
@@ -129,9 +163,10 @@ class SISHDatabase:
         ]
 
         # ---- create multiprocessing pool ----
-        num_workers = mp.cpu_count()
-        self.pool = mp.Pool(num_workers)
-        logging.debug(f"Initialized multiprocessing pool with {num_workers} workers")
+        #num_workers = mp.cpu_count()
+        #self.pool = mp.Pool(num_workers)
+        #logging.debug(f"Initialized multiprocessing pool with {num_workers} workers")
+        self.pool = None
 
     def build_index(self) -> None:
         """
@@ -163,15 +198,16 @@ class SISHDatabase:
             patches = mosaic_data['patches']
 
             # ---- compute latent codes via VQ-VAE ----
-            latents = compute_latent_features(
-                mosaic_pkl,
-                transform=self.transform_vqvqe,
-                vqvae=self.vqvae,
-                device=self.device,
-                batch_size=16,
-                num_workers=self.config['experiment']['num_workers'],
-            )
-            logging.debug(f"Computed {latents.shape[0]} latents for slide {slide_id}")
+            with torch.no_grad():
+                latents = compute_latent_features(
+                    mosaic_pkl,
+                    transform=self.transform_vqvqe,
+                    vqvae=self.vqvae,
+                    device=self.device,
+                    batch_size=8,
+                    num_workers=self.config['experiment']['num_workers'],
+                )
+                logging.debug(f"Computed {latents.shape[0]} latents for slide {slide_id}")
 
             # ---- map latents to integer indices ----
             slide_index = slide_to_index(
@@ -180,22 +216,42 @@ class SISHDatabase:
                 pool_layers=self.pool_layers,
                 pool=self.pool
             )
+
+            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
             logging.debug(f"Mapped latents to integer indices for slide {slide_id}")
 
             # ---- record binarized features and locations ----
             for idx, key in enumerate(slide_index):
-                bin_feat = min_max_binarized(patches[idx]['feature'])
+                # 1) original numeric vector (e.g., float32[dim])
+                vec  = patches[idx]['feature']
+
+                # 2) threshold -> 0/1, then pack 8 bits per byte
+                bits_packed = np.packbits((vec > 0).astype('uint8')).tobytes()
+
                 x, y = patches[idx]['loc']
                 entry = {
-                    'slide_name': slide_id,
-                    'dense_binarized': bin_feat,
-                    'patient_id': patient_id,
-                    'category': label,
-                    'x': x,
-                    'y': y,
-                }
+                     'slide_name': slide_id,
+                     'bits'      : bits_packed,   
+                     'patient_id': patient_id,
+                     'category'  : label,
+                     'x': x,
+                     'y': y,}  
                 self.meta.setdefault(key, []).append(entry)
                 self.keys.append(int(key))
+
+                # 3) free the large float array right now
+                patches[idx]['feature'] = None
+        
+            gc.collect()
+            del latents, mosaic_data, patches
+            torch.cuda.empty_cache()   
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            log_mem(f"after slide {slide_id}")
 
         logging.info(f"Collected total of {len(self.keys)} keys from all slides.")
 
@@ -213,6 +269,181 @@ class SISHDatabase:
         with open(self.meta_database_path, 'wb') as f:
             pickle.dump(self.meta, f)
         logging.info(f"Saved VEB tree to {self.index_veb_path!r} and metadata to {self.meta_database_path!r}")
+    
+    def build_index_shards(self, resume: bool = True, shard_size: int = 25) -> None:
+        """
+        Build the VEB index with resumable checkpoints.
+        - Stores partial self.meta/self.keys to disk in shards every `shard_size` slides.
+        - On resume, skips finished slides and continues.
+        """
+        # -------- paths --------
+        project_dir = os.path.join("experiments", self.config['experiment']['project_name'])
+        sish_dir    = os.path.join(project_dir, "sish")
+        os.makedirs(sish_dir, exist_ok=True)
+
+        shard_dir   = os.path.join(sish_dir, f"tmp_shards_{self.mosaic_string}")
+        os.makedirs(shard_dir, exist_ok=True)
+
+        self.index_veb_path      = os.path.join(sish_dir, f"veb_{self.mosaic_string}.pkl")
+        self.meta_database_path  = os.path.join(sish_dir, f"meta_{self.mosaic_string}.pkl")
+        manifest_path            = os.path.join(shard_dir, "manifest.json")
+
+        # -------- load manifest or init --------
+        if resume and os.path.exists(manifest_path):
+            with open(manifest_path, "r") as f:
+                mani = json.load(f)
+            processed_slides = set(mani["processed_slides"])
+            shard_idx        = mani["next_shard_idx"]
+            max_key_seen     = mani["max_key_seen"]
+            logging.info(f"[SISH] Resuming. {len(processed_slides)} slides already done. Next shard {shard_idx}.")
+        else:
+            processed_slides = set()
+            shard_idx        = 0
+            max_key_seen     = -1
+
+        # -------- scratch batches --------
+        meta_batch  = defaultdict(list)   # key -> list[entry] (temporary)
+        keys_batch  = []                  # list[int] (temporary)
+
+        def flush_shard():
+            nonlocal shard_idx, meta_batch, keys_batch
+            if not keys_batch and not meta_batch:
+                return
+            meta_path = os.path.join(shard_dir, f"meta_shard_{shard_idx:04d}.pkl")
+            keys_path = os.path.join(shard_dir, f"keys_shard_{shard_idx:04d}.npy")
+            with open(meta_path, "wb") as f:
+                pickle.dump(dict(meta_batch), f, protocol=pickle.HIGHEST_PROTOCOL)
+            np.save(keys_path, np.array(keys_batch, dtype=np.int64))
+            logging.info(f"[SISH] Flushed shard {shard_idx:04d}: {len(keys_batch)} keys, {len(meta_batch)} unique keys")
+
+            # reset
+            meta_batch.clear()
+            keys_batch.clear()
+            shard_idx += 1
+            gc.collect()
+
+            # update manifest on disk
+            mani = {
+                "processed_slides": sorted(processed_slides),
+                "next_shard_idx": shard_idx,
+                "max_key_seen": max_key_seen
+            }
+            with open(manifest_path, "w") as f:
+                json.dump(mani, f, indent=2)
+
+        # -------- main loop --------
+        to_iterate = list(self.slide_representations_paths.items())
+        logging.info("Reset metadata and key lists before index build." if not processed_slides else
+                    "Continuing metadata build.")
+
+        for slide_id, mosaic_pkl in to_iterate:
+            if slide_id in processed_slides:
+                continue
+
+            label      = self.annotations.at[slide_id, 'category']
+            patient_id = self.annotations.at[slide_id, 'patient']
+            logging.debug(f"Indexing slide {slide_id}: category={label}, patient={patient_id}")
+
+            mosaic_data = load_patch_dicts_pickle(mosaic_pkl, reconstruct_features=True)
+            patches     = mosaic_data['patches']
+
+            # latent calc
+            with torch.no_grad():
+                latents = compute_latent_features(
+                    mosaic_pkl,
+                    transform=self.transform_vqvqe,
+                    vqvae=self.vqvae,
+                    device=self.device,
+                    batch_size=8,
+                    num_workers=self.config['experiment']['num_workers'],
+                )
+            slide_index = slide_to_index(
+                latents,
+                self.codebook_semantic,
+                pool_layers=self.pool_layers,
+                pool=self.pool
+            )
+
+            for idx, key in enumerate(slide_index):
+                vec  = patches[idx]['feature']
+                bits_packed = np.packbits((vec > 0).astype('uint8')).tobytes()
+                x, y = patches[idx]['loc']
+                entry = {
+                    'slide_name': slide_id,
+                    'bits'      : bits_packed,
+                    'patient_id': patient_id,
+                    'category'  : label,
+                    'x': x,
+                    'y': y,
+                }
+                meta_batch[key].append(entry)
+                keys_batch.append(int(key))
+                max_key_seen = max(max_key_seen, int(key))
+                patches[idx]['feature'] = None
+
+            # housekeeping
+            processed_slides.add(slide_id)
+            del latents, mosaic_data, patches
+            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.ipc_collect()
+            gc.collect()
+
+            # flush every shard_size slides
+            if len(processed_slides) % shard_size == 0:
+                flush_shard()
+
+        # final flush
+        flush_shard()
+
+        # -------- combine shards into final meta/keys (streaming) --------
+        logging.info("[SISH] Loading shards to assemble final meta/keys for VEB build")
+        self.meta = defaultdict(list)
+        self.keys = []
+
+        # stream merge to avoid big memory spikes
+        for i in range(shard_idx):
+            meta_path = os.path.join(shard_dir, f"meta_shard_{i:04d}.pkl")
+            keys_path = os.path.join(shard_dir, f"keys_shard_{i:04d}.npy")
+            if not os.path.exists(meta_path):
+                continue
+            with open(meta_path, "rb") as f:
+                part_meta = pickle.load(f)
+            for k, lst in part_meta.items():
+                self.meta[k].extend(lst)
+            part_keys = np.load(keys_path)
+            self.keys.extend(part_keys.tolist())
+            # free
+            del part_meta, part_keys
+            gc.collect()
+
+        logging.info(f"Collected total of {len(self.keys)} keys from all slides.")
+
+        # -------- build VEB --------
+        universe = max_key_seen
+        logging.info(f"Universe size of VEB tree: {universe}")
+        self.vebtree = VEB(universe)
+        for k in self.keys:
+            self.vebtree.insert(k)
+        logging.info("VEB tree constructed successfully.")
+
+        # save final objects
+        with open(self.index_veb_path, 'wb') as f:
+            pickle.dump(self.vebtree, f, protocol=pickle.HIGHEST_PROTOCOL)
+        with open(self.meta_database_path, 'wb') as f:
+            pickle.dump(dict(self.meta), f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        logging.info(f"Saved VEB tree to {self.index_veb_path!r} and metadata to {self.meta_database_path!r}")
+
+        # optional: clean shards
+        try:
+            for fn in os.listdir(shard_dir):
+                if fn.endswith((".pkl", ".npy")):
+                    os.remove(os.path.join(shard_dir, fn))
+            os.remove(manifest_path)
+            os.rmdir(shard_dir)
+        except OSError:
+            pass
 
     def leave_one_patient(self, patient_id: str) -> None:
         """
@@ -303,29 +534,24 @@ class SISHDatabase:
                     #logging.info(f"No candidates found for index {pre}; skipping")
                     pre_prev = pre
                     continue
-                #logging.info(f"Found {len(candidates_clean)} candidates for index {pre}")
+                logging.info(f"Found {len(candidates_clean)} candidates for index {pre}")
 
                 # ---- compute hamming distances ----
                 if len(candidates_clean) > 1:
-                    dists = [
-                        bin(int(e['dense_binarized'], 2) ^ int(dense_feat, 2)).count('1')
-                        for e in candidates_clean
-                    ]
+                    dists = [hamming_bytes(e['bits'], dense_feat) for e in candidates_clean]
                     min_idx = int(np.argmin(dists))
                     hamming_dist = dists[min_idx]
                 else:
                     min_idx = 0
-                    hamming_dist = bin(
-                        int(candidates_clean[0]['dense_binarized'], 2) ^ int(dense_feat, 2)
-                    ).count('1')
+                    hamming_dist = hamming_bytes(candidates_clean[0]['bits'], dense_feat)
 
                 # ---- accept candidate if within threshold ----
                 if hamming_dist <= thrsh:
-                    #logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {thrsh}")
+                    logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {thrsh}")
                     entry = candidates_clean[min_idx]
                     visited[pre] = True
                     if not self.is_patch:
-                        #logging.info(f"Slide mode: {entry['slide_name']}")
+                        logging.info(f"Slide mode: {entry['slide_name']}")
                         res.append((
                             query_index,
                             pre,
@@ -346,8 +572,8 @@ class SISHDatabase:
                             entry['patch_name'],
                             entry['category'],
                         ))
-                #else:
-                    #logging.info(f"Hamming distance {hamming_dist} exceeds threshold {thrsh}; skipping")
+                else:
+                    logging.info(f"Hamming distance {hamming_dist} exceeds threshold {thrsh}; skipping")
 
                 p_count += 1
                 pre_prev = pre
@@ -363,30 +589,25 @@ class SISHDatabase:
                 candidates_clean = [e for e in candidates if e['patient_id'] != patient_id]
 
                 if not candidates_clean:
-                    #logging.info(f"No candidates found for index {succ}; skipping")
+                    logging.info(f"No candidates found for index {succ}; skipping")
                     succ_prev = succ
                     continue
-                #logging.info(f"Found {len(candidates_clean)} candidates for index {succ}")
+                logging.info(f"Found {len(candidates_clean)} candidates for index {succ}")
 
                 if len(candidates_clean) > 1:
-                    dists = [
-                        bin(int(e['dense_binarized'], 2) ^ int(dense_feat, 2)).count('1')
-                        for e in candidates_clean
-                    ]
+                    dists = [hamming_bytes(e['bits'], dense_feat) for e in candidates_clean]
                     min_idx = int(np.argmin(dists))
                     hamming_dist = dists[min_idx]
                 else:
                     min_idx = 0
-                    hamming_dist = bin(
-                        int(candidates_clean[0]['dense_binarized'], 2) ^ int(dense_feat, 2)
-                    ).count('1')
+                    hamming_dist = hamming_bytes(candidates_clean[0]['bits'], dense_feat)
 
                 if hamming_dist <= thrsh:
-                    #logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {thrsh}")
+                    logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {thrsh}")
                     entry = candidates_clean[min_idx]
                     visited[succ] = True
                     if not self.is_patch:
-                        #logging.info(f"Accepted candidate: {entry}")
+                        logging.info(f"Accepted candidate: {entry}")
                         res.append((
                             query_index,
                             succ,
@@ -407,8 +628,8 @@ class SISHDatabase:
                             entry['patch_name'],
                             entry['category'],
                         ))
-                #else:
-                    #logging.info(f"Hamming distance {hamming_dist} exceeds threshold {thrsh}; skipping")
+                else:
+                    logging.info(f"Hamming distance {hamming_dist} exceeds threshold {thrsh}; skipping")
                     
                 s_count += 1
                 succ_prev = succ
@@ -572,7 +793,7 @@ class SISHDatabase:
         bags = data['results']
         total_bags = sum(len(b) for b in bags)
         if total_bags == 0:
-            logging.warning(f"No retrievals for slide {slide_id}; skipping")
+            #logging.warning(f"No retrievals for slide {slide_id}; skipping")
             return {
                 "query_slide_id": slide_id,
                 "query_label": data['label_query'],
@@ -626,7 +847,19 @@ class SISHDatabase:
         """
         Leave‐one‐patient‐out retrieval benchmark.
         """
-        # load or build index/meta…
+        if os.path.exists(self.index_veb_path) and os.path.exists(self.meta_database_path):
+            # both files are there -> load them
+            with open(self.index_veb_path, 'rb') as f:
+                self.vebtree = pickle.load(f)
+            with open(self.meta_database_path, 'rb') as f:
+                self.meta = pickle.load(f)
+            logging.info(f"Loaded VEB tree from {self.index_veb_path!r} and metadata from {self.meta_database_path!r}")
+        else:
+            # files missing or incomplete -> rebuild
+            logging.warning("Index files not found or incomplete; rebuilding index.")
+            #self.build_index()
+            self.build_index_shards(resume=True, shard_size=100)
+
         topk_results = []
         for slide_id in self.slide_representations_paths:
             patient_id = self.annotations.at[slide_id, 'patient']
@@ -637,7 +870,7 @@ class SISHDatabase:
             for key, entries in self.meta.items():
                 for entry in entries:
                     if entry['slide_name'] == slide_id:
-                        patient_indexes.append((key, entry['dense_binarized']))
+                        patient_indexes.append((key, entry['bits']))
 
             # run the per‐patch query
             slide_outputs = [self.query(idx, feat, patient_id) for idx, feat in patient_indexes]

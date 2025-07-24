@@ -57,13 +57,22 @@ import random
 from typing import List, Dict
 import multiprocessing as mp
 
+import psutil, gc, tempfile, errno
+import torch
+import torch.multiprocessing as tmp
+
+# Use file-backed tensors instead of /dev/shm
+tmp.set_start_method("spawn", force=True)
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 from ..benchmarking.benchmark import calculate_combinations, generate_bags
 from ..utils.utils import free_up_gpu_memory
 import pathbench.image_retrieval.patch_selection as patch_selection_module
 from ..image_retrieval.yottixel_search import YottixelDatabase
+from ..image_retrieval.retccl_search import RetCCLDatabase
 from ..image_retrieval.sish_search import SISHDatabase
 from ..image_retrieval.config_validator import SISConfigValidator
-from ..image_retrieval.utils import load_patch_dicts_from_tfr, load_patch_dicts_pickle, save_patch_dicts_pickle, save_retrieval_metrics, save_retrieval_results_to_excel
+from ..image_retrieval.utils import load_patch_dicts_from_tfr, load_patch_dicts_pickle, save_patch_dicts_pickle, save_retrieval_metrics, save_retrieval_results_to_excel, log_mem, cleanup_dev_shm
 from ..image_retrieval.vis_patch_selection import generate_patch_selection_report_pdf
 from ..image_retrieval.evaluation import evaluate_retrieval_metrics, parse_metric_names
 from ..image_retrieval.vis_retrieval_results import generate_image_retrieval_report_pdf
@@ -552,6 +561,12 @@ def benchmark_sis(config, project):
 
         # ---- Feature extraction ----
         bags = perform_feature_extraction(config, project, all_data, combination_dict, feature_string)
+        
+        del bags
+        gc.collect()
+        torch.cuda.empty_cache()
+        cleanup_dev_shm()
+        log_mem("after feature extraction")
 
         # ---- Define features_folder_path ----
         features_folder_path = os.path.join(bags_base, feature_string)
@@ -603,7 +618,7 @@ def benchmark_sis(config, project):
                     logging.warning(f"Patch visualization failed for {mosaic_method}_{feature_string}: {e}")
 
             logging.info("Mosaic patch visualizations saved to PDF.")
-
+            del slide_mosaic_paths
         elif validator.is_slide_model(combination_dict.get("feature_extraction")):
             slide_representation_paths = {
                 os.path.splitext(os.path.basename(p))[0]: p
@@ -612,16 +627,26 @@ def benchmark_sis(config, project):
             mosaic_method = "slide"
             logging.info(f"Found slide-level features for {len(slide_representation_paths)} slides in {features_folder_path}")
 
+        gc.collect()
+        torch.cuda.empty_cache()
+        cleanup_dev_shm()
+        log_mem("after mosaics + viz")
+
         # ---- Generate UMAP plots (if requested) ----
         umap_base = os.path.join(vis_base, f"umap_{mosaic_method}_{feature_string}")
 
-        if any(viz.startswith("UMAP") for viz in config.get("visualization", [])):
+        if any(viz.startswith("UMAP") for viz in config["experiment"].get("visualization", [])):
             run_umap_visualizations(
                 config=config, 
                 slide_representation_paths=slide_representation_paths, 
                 mosaic_method=mosaic_method, 
                 output_base=umap_base
             )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        cleanup_dev_shm()
+        log_mem("after UMAP")
 
         # ---- Similar Image Search Benchmark ----
         search_string = combination_dict.get('search_method', 'yottixel-10')
@@ -640,7 +665,15 @@ def benchmark_sis(config, project):
             search_database = YottixelDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k)
             results = search_database.leave_one_patient_out()
         elif search_method.lower() == 'sish':
+            gc.collect()
+            torch.cuda.empty_cache()
+            cleanup_dev_shm()
+            log_mem("before SISH")
+            
             search_database = SISHDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k, mosaic_string=f"{mosaic_method}_{feature_string}")
+            results = search_database.leave_one_patient_out()
+        elif search_method.lower() == 'retccl':
+            search_database = RetCCLDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k)
             results = search_database.leave_one_patient_out()
         else:
             raise ValueError(f"Search method '{search_method}' is not implemented. Please choose a supported method.")

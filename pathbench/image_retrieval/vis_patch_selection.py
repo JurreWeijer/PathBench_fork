@@ -23,6 +23,7 @@ import math
 import slideflow as sf
 import cv2
 from typing import Dict, Optional
+import gc
 
 from ..image_retrieval.utils import load_patch_dicts_pickle
 from .vis_utils import get_dataset_name_for_slide, get_path_from_dataset, crop_roi, load_qupath_rois, load_patch_dicts_pickle
@@ -129,6 +130,8 @@ def visualize_selected_patches_simple(
         rec = tfr[p["tfr_index"]]
         img = sf.io.decode_image(bytes(rec["image_raw"]))
         patch_images.append(Image.fromarray(np.array(img)))
+    tfr.close()                
+    del tfr
 
     # 4) Build composite grid below thumbnail
     n = len(patch_images)
@@ -396,11 +399,103 @@ def generate_patch_selection_report_pdf(
                             E.g. "/path/to/reports/patch_report"
         max_per_file:       Maximum slides per PDF.
     """
+    # detect which mode to use
+    vizs = config["experiment"].get("visualization", [])
+    patch_vis = [v for v in vizs if v.startswith("patch_selection-")]
+    mode = (patch_vis[0].split("-",1)[1] if patch_vis else "simple")
+    if mode not in ("simple","extensive"):
+        mode = "simple"
+
+    items = list(slide_mosaic_paths.items())
+    total = len(items)
+    parts = math.ceil(total / max_per_file)
+
+    for part in range(parts):
+        start = part * max_per_file
+        end   = min(start + max_per_file, total)
+        chunk = items[start:end]
+
+        out_pdf = f"{pdf_base}.pdf" if parts == 1 else f"{pdf_base}_part{part+1}.pdf"
+        os.makedirs(os.path.dirname(out_pdf), exist_ok=True)
+
+        with PdfPages(out_pdf) as pdf:
+            for slide_id, mosaic_pkl in chunk:
+                try:
+                    slide_path = all_data.find_slide(slide=slide_id)
+                    if slide_path is None:
+                        logging.warning(f"Slide not found: {slide_id}")
+                        continue
+
+                    mosaics_folder = os.path.dirname(mosaic_pkl)
+
+                    # ---- generate 1 image and immediately write it ----
+                    if mode == "simple":
+                        img = visualize_selected_patches_simple(
+                            config, slide_id, slide_path, mosaics_folder
+                        )
+                    else:
+                        img = visualize_selected_patches_extensive(
+                            config, slide_id, slide_path, mosaics_folder,
+                            patch_px, patch_um
+                        )
+                    if img is None:
+                        continue
+
+                    img = add_title(img, f"{slide_id} - {mosaic_method}")
+                    arr = np.array(img)
+
+                    fig = plt.figure(figsize=(arr.shape[1]/100, arr.shape[0]/100), dpi=100)
+                    plt.axis("off")
+                    plt.imshow(arr)
+                    pdf.savefig(fig, bbox_inches='tight', pad_inches=0.0)
+                    plt.close(fig)
+
+                except Exception as e:
+                    logging.warning(f"Viz failed for {slide_id}: {e}")
+
+                # ---- FREE per-slide memory ----
+                del img, arr
+                gc.collect()
+        logging.info(f"Wrote slides {start+1}-{end} → {out_pdf}")
+    
+    # ---- FINAL CLEANUP -------------------------------------------------
+    import gc, psutil, os
+    try:
+        import torch
+    except ImportError:
+        torch = None
+
+    # Drop big locals that may still reference images/arrays
+    for name in ["items", "chunk", "img", "arr", "slide_mosaic_paths",
+                 "all_data", "mosaics_folder"]:
+        if name in locals():
+            del locals()[name]
+
+    # Close any stray matplotlib figures (PdfPages context is already closed)
+    import matplotlib.pyplot as plt
+    plt.close('all')
+
+    gc.collect()
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return
+
+"""def generate_patch_selection_report_pdf(
+    config,
+    all_data,
+    slide_mosaic_paths,
+    mosaic_method,
+    pdf_base,
+    patch_px,
+    patch_um, 
+    max_per_file: int = 200
+):
     # --- collect all composites up front ---
     composites = []
     slide_ids  = []
     # detect which mode to use
-    vizs      = config.get("visualization", [])
+    vizs      = config["experiment"].get("visualization", [])
     patch_vis = [v for v in vizs if v.startswith("patch_selection-")]
     if not patch_vis:
         logging.info("No patch_selection method specified; defaulting to 'simple'")
@@ -475,7 +570,7 @@ def generate_patch_selection_report_pdf(
             append_images=rest,
             resolution=100
         )
-        logging.info(f"Wrote slides {start+1}-{end} → {out_pdf}")
+        logging.info(f"Wrote slides {start+1}-{end} → {out_pdf}")"""
 
 """def generate_patch_selection_report_pdf(
     config,
