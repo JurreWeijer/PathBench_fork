@@ -118,6 +118,8 @@ def visualize_retrieval_result(
 
     # 5) crop & paste query
     qpath = all_data.find_slide(slide=qid)
+    print(f"q ID in visualization f{qid}")
+    print(f"q path in visualization f{qpath}")
     qimg, (Wq,Hq), _ = crop_roi(config, qpath, qid, THUMB_SIZE, BORDER_PX)
     qp = np.array(qimg)[:,:,::-1]  # BGR
 
@@ -195,6 +197,8 @@ def visualize_retrieval_result(
         # crop & paste hit ROI
         hid   = hit["slide_id"]
         hpath = all_data.find_slide(slide=hid)
+        print(f"h ID in visualization f{hid}")
+        print(f"h path in visualization f{hpath}")
         himg, _, _ = crop_roi(config, hpath, hid, THUMB_SIZE, BORDER_PX)
         hip = np.array(himg)[:,:,::-1]
 

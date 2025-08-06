@@ -25,6 +25,8 @@ import functools
 from functools import reduce
 from operator import mul
 from conch.open_clip_custom import create_model_from_pretrained
+from typing import Literal
+from contextlib import contextmanager
 
 #Set weights dir based on the $WEIGHTS_DIR environment variable
 WEIGHTS_DIR = os.environ.get('WEIGHTS_DIR', "./pretrained_weights")
@@ -2658,7 +2660,65 @@ class SlideFeatureExtractor(TorchFeatureExtractor):
             self.device = torch.device("cuda")
         else:
             self.device = torch.device("cpu")
+    
+    # --------- NEW HELPERS -------------
+    def use_tile_encoder(self, device: str = "cuda", empty_cache: bool = True):
+        """Put tile encoder on GPU, slide encoder on CPU."""
+        self._set_active_encoder("tile", device=device, empty_cache=empty_cache)
 
+    def use_slide_encoder(self, device: str = "cuda", empty_cache: bool = True):
+        """Put slide encoder on GPU, tile encoder on CPU."""
+        self._set_active_encoder("slide", device=device, empty_cache=empty_cache)
+
+    def deactivate_all(self, empty_cache: bool = True):
+        """Move both encoders to CPU (free up GPU)."""
+        self._move_if_exists(self.tile_encoder, "cpu")
+        self._move_if_exists(self.slide_encoder, "cpu")
+        self._active = None
+        if empty_cache:
+            torch.cuda.empty_cache()
+
+    def _set_active_encoder(
+        self,
+        which: Literal["tile", "slide"],
+        device: str = "cuda",
+        empty_cache: bool = True,
+    ):
+        assert which in ("tile", "slide")
+        gpu = torch.device(device) if torch.cuda.is_available() else torch.device("cpu")
+        cpu = torch.device("cpu")
+
+        if which == "tile":
+            self._move_if_exists(self.tile_encoder, gpu)
+            self._move_if_exists(self.slide_encoder, cpu)
+        else:
+            self._move_if_exists(self.slide_encoder, gpu)
+            self._move_if_exists(self.tile_encoder, cpu)
+
+        self._active = which
+        if empty_cache and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    @staticmethod
+    def _move_if_exists(module, device: torch.device):
+        if module is not None and isinstance(module, torch.nn.Module):
+            module.to(device)
+
+    @contextmanager
+    def using(self, which: Literal["tile", "slide"], device: str = "cuda", empty_cache: bool = True):
+        """Context manager: temporarily activate one encoder on GPU."""
+        prev = self._active
+        self._set_active_encoder(which, device=device, empty_cache=empty_cache)
+        try:
+            yield self
+        finally:
+            # Return to prior state (or CPU) — your choice
+            if prev is None:
+                self.deactivate_all(empty_cache=empty_cache)
+            else:
+                self._set_active_encoder(prev, device=device, empty_cache=empty_cache)
+
+    # --------- EXISTING FORWARDS -------------
     def forward(self, x):
         return self.tile_encoder(x)
 
@@ -2679,7 +2739,7 @@ class gigapath_slide(SlideFeatureExtractor):
         tile_px: int = 256,
         **kwargs
     ):
-        super().__init__(**kwargs)
+        super().__init__(tile_px=tile_px, **kwargs)
 
         self.build_encoders()
         self.num_features = self.tile_encoder.num_features
@@ -2707,8 +2767,10 @@ class gigapath_slide(SlideFeatureExtractor):
             global_pool=True
         )
 
-        self.slide_encoder.to('cuda')
-        self.slide_encoder.eval()
+        if isinstance(self.tile_encoder, torch.nn.Module):
+            self.tile_encoder.to('cpu').eval()
+        if isinstance(self.slide_encoder, torch.nn.Module):
+            self.slide_encoder.to('cpu').eval()
 
     def forward_slide(self, tile_features, tile_coordinates, **kwargs):
         tile_features = tile_features.unsqueeze(0)
@@ -2730,9 +2792,8 @@ class titan_slide(SlideFeatureExtractor):
 
     tag = 'titan_slide'
     def __init__(self, tile_px: 256, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(tile_px=tile_px, **kwargs)
         self.build_encoders()
-        self.tile_px = tile_px
         self.model = self.tile_encoder
         self.transform = transforms.Compose(
             [
@@ -2750,11 +2811,9 @@ class titan_slide(SlideFeatureExtractor):
         self.slide_encoder = AutoModel.from_pretrained(
             "MahmoodLab/TITAN", trust_remote_code=True
         )
-        self.slide_encoder.to('cuda')
         self.slide_encoder.eval()
 
         self.tile_encoder, self.eval_transform = self.slide_encoder.return_conch()
-        self.tile_encoder.to('cuda')
         self.tile_encoder.eval()
         
         #Add transform to 
@@ -2781,9 +2840,8 @@ class prism_slide(SlideFeatureExtractor):
     """
     tag = 'prism_slide'
     def __init__(self, tile_px: int = 256, **kwargs):
-        super().__init__()
+        super().__init__(tile_px=tile_px, **kwargs)
         self.build_encoders()
-        self.tile_px = tile_px
         self.model = self.tile_encoder
         self.transform = transforms.Compose(
             [
@@ -2800,10 +2858,12 @@ class prism_slide(SlideFeatureExtractor):
         self.slide_encoder = AutoModel.from_pretrained(
             "paige-ai/PRISM", trust_remote_code=True
         )
-        self.slide_encoder.to('cuda')
-        self.slide_encoder.eval()
+        if isinstance(self.slide_encoder, torch.nn.Module):
+            self.slide_encoder.to('cpu').eval()
 
         self.tile_encoder = virchow(tile_px=self.tile_px, mode="full")
+        if isinstance(self.tile_encoder, torch.nn.Module):
+            self.tile_encoder.to('cpu').eval()
 
 
     def forward_slide(self, tile_features, tile_coordinates, **kwargs):

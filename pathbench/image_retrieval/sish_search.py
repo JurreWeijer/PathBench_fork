@@ -436,14 +436,14 @@ class SISHDatabase:
         logging.info(f"Saved VEB tree to {self.index_veb_path!r} and metadata to {self.meta_database_path!r}")
 
         # optional: clean shards
-        try:
-            for fn in os.listdir(shard_dir):
-                if fn.endswith((".pkl", ".npy")):
-                    os.remove(os.path.join(shard_dir, fn))
-            os.remove(manifest_path)
-            os.rmdir(shard_dir)
-        except OSError:
-            pass
+        #try:
+        #    for fn in os.listdir(shard_dir):
+        #        if fn.endswith((".pkl", ".npy")):
+        #            os.remove(os.path.join(shard_dir, fn))
+        #    os.remove(manifest_path)
+        #    os.rmdir(shard_dir)
+        #except OSError:
+        #    pass
 
     def leave_one_patient(self, patient_id: str) -> None:
         """
@@ -858,7 +858,7 @@ class SISHDatabase:
             # files missing or incomplete -> rebuild
             logging.warning("Index files not found or incomplete; rebuilding index.")
             #self.build_index()
-            self.build_index_shards(resume=True, shard_size=100)
+            self.build_index_shards()
 
         topk_results = []
         for slide_id in self.slide_representations_paths:

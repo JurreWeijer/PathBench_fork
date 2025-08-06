@@ -496,6 +496,58 @@ def create_slide_mosaic_mp(
 
     return slide_mosaic_paths
 
+def create_slide_feature_paths(
+    config,
+    all_data,
+    features_folder_path: str,
+    ext: str = ".pt",
+    strict: bool = False
+):
+    """
+    Build a dict mapping slide_id -> feature tensor path for slide-level models.
+
+    This mirrors the output shape of `create_slide_mosaic_mp`, but we only
+    verify that the feature file exists—no patch selection is performed.
+
+    Parameters
+    ----------
+    config : dict
+        Experiment config (only used for logging consistency here).
+    all_data : sf.Dataset
+        Slideflow dataset returned by `project.dataset(...)`.
+    features_folder_path : str
+        Directory containing the slide-level feature files.
+    ext : str
+        Extension of the feature files (default: '.pt').
+    strict : bool
+        If True, raise FileNotFoundError when a slide is missing a feature.
+        If False, log a warning and skip missing slides.
+
+    Returns
+    -------
+    slide_representation_paths : Dict[str, str]
+        slide_id -> absolute feature path
+    missing : List[str]
+        slide_ids without a corresponding feature file
+    """
+    slide_representation_paths = {}
+
+    # Iterate exactly like in create_slide_mosaic_mp (over TFRecords)
+    for tfr_path in tqdm(all_data.tfrecords(), desc="Scanning slides for features", file=sys.stdout):
+        # Keep slide_id derivation consistent with the rest of the pipeline
+        rec = sf.TFRecord(tfr_path)[0]
+        slide_id = rec.get("slide", os.path.splitext(os.path.basename(tfr_path))[0])
+
+        feat_path = os.path.join(features_folder_path, f"{slide_id}{ext}")
+        if os.path.exists(feat_path) and os.path.getsize(feat_path) > 0:
+            slide_representation_paths[slide_id] = feat_path
+        else:
+            logger.warning(f"Features are missing for slide {slide_id}")
+
+    logger.info("Collected %d slide-level feature paths.", len(slide_representation_paths))
+
+    return slide_representation_paths
+
 def benchmark_sis(config, project):
     """
     Benchmarking for image retrieval experiments.
@@ -620,10 +672,7 @@ def benchmark_sis(config, project):
             logging.info("Mosaic patch visualizations saved to PDF.")
             del slide_mosaic_paths
         elif validator.is_slide_model(combination_dict.get("feature_extraction")):
-            slide_representation_paths = {
-                os.path.splitext(os.path.basename(p))[0]: p
-                for p in glob.glob(os.path.join(features_folder_path, "*.pt"))
-                }
+            slide_representation_paths = create_slide_feature_paths(config, all_data, features_folder_path)
             mosaic_method = "slide"
             logging.info(f"Found slide-level features for {len(slide_representation_paths)} slides in {features_folder_path}")
 

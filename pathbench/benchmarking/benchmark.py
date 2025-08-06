@@ -231,8 +231,7 @@ def get_save_strings(combination_dict: dict) -> str:
     """
     save_string = "_".join([f"{value}" for key, value in combination_dict.items()])
     
-    string_without_mil = "_".join([f"{value}" for key, value in combination_dict.items() if key != 'mil' and key != 'loss' and key != 'augmentation' and key != 'activation_function' and key != 'optimizer' and key != 'dropout_p' and key != 'encoder_layers' and key != 'z_dim' and key != "activation_function"])
-    
+    string_without_mil = "_".join([f"{value}" for key, value in combination_dict.items() if key != 'mil' and key != 'loss' and key != 'augmentation' and key != 'activation_function' and key != 'optimizer' and key != 'dropout_p' and key != 'encoder_layers' and key != 'z_dim' and key != "activation_function" and key != 'mosaic_method' and key != 'search_method'])
     logging.debug(f"Save string: {save_string}")
     logging.debug(f"String without MIL: {string_without_mil}")
     return save_string, string_without_mil
