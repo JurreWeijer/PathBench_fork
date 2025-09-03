@@ -79,22 +79,12 @@ class Experiment():
 
         # Check if GPU is available
         if torch.cuda.is_available():
-            try:
-                # Check if device already set
-                device = torch.cuda.current_device()
-            except NameError:
-                # Set device to GPU
-                device = torch.device('cuda')
-                torch.cuda.set_device(device)
-                logging.info(f'Using GPU: {torch.cuda.get_device_name(device)}')
+            device = torch.device('cuda')
+            torch.cuda.set_device(device)
+            logging.info(f'Using GPU: {torch.cuda.get_device_name(device)}')
         else:
-            try:
-                # Check if device already set
-                device = torch.cuda.current_device()
-            except NameError:
-                # Set device to CPU
-                device = torch.device('cpu')
-                logging.info('Using CPU')
+            device = torch.device('cpu')
+            logging.info('Using CPU')
 
         self.load_datasets()
         #Set Hugging Face token

@@ -435,6 +435,33 @@ def create_slide_feature_paths(
     logger.info("Collected %d slide-level feature paths.", len(slide_representation_paths))
     return slide_representation_paths
 
+def check_precomputed_features(all_data, features_folder_path):
+    """
+    Verify that all required precomputed features exist for the slides.
+
+    Args:
+        all_data: Slideflow dataset object (provides .tfrecords()).
+        features_folder_path (str): Path to the folder containing .pt and .index.npz files.
+
+    Returns:
+        None
+
+    Raises:
+        FileNotFoundError: If one or more features are missing.
+    """
+    missing = []
+    for tfr_path in all_data.tfrecords():
+        slide_id = os.path.splitext(os.path.basename(tfr_path))[0]
+        feats_pt  = os.path.join(features_folder_path, f"{slide_id}.pt")
+        feats_idx = os.path.join(features_folder_path, f"{slide_id}.index.npz")
+        if not (os.path.exists(feats_pt) and os.path.exists(feats_idx)):
+            missing.append(slide_id)
+
+    if missing:
+        logging.error(f"Missing features for {len(missing)} slides: {', '.join(missing[:10])}"
+                      f"{' ...' if len(missing) > 10 else ''}")
+        raise FileNotFoundError("Precomputed features are missing. Cannot continue without GPU.")
+
 def benchmark_sis(config, project):
     """
     Benchmarking for image retrieval experiments.
@@ -499,11 +526,14 @@ def benchmark_sis(config, project):
         all_data = perform_tile_extraction(config, project, combination_dict)
 
         # ---- Feature extraction ----
-        bags = perform_feature_extraction(config, project, all_data, combination_dict, feature_string)
-        del bags
-
-        # ---- Define features_folder_path ----
         features_folder_path = os.path.join(bags_base, feature_string)
+
+        if torch.cuda.is_available():
+            bags = perform_feature_extraction(config, project, all_data, combination_dict, feature_string)
+            del bags
+        else:
+            check_precomputed_features(all_data, features_folder_path) 
+            logging.info("No GPU detected. Skipping feature extraction and using precomputed features.") 
 
         # ---- Mosaic creation ----
         if validator.is_patch_model(combination_dict.get("feature_extraction")):
