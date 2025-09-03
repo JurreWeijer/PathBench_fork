@@ -159,15 +159,37 @@ def load_patch_dicts_pickle(path, reconstruct_features=False):
         recon.append(copy)
 
     return {"properties": props, "patches": recon}
-
+"""
 def load_qupath_rois(csv_path: str) -> MultiPolygon:
-    """
-    Load QuPath‐exported CSV with columns [ROI_Name, X_base, Y_base]
-    and return a unified Shapely polygon (possibly MultiPolygon).
-    """
     df = pd.read_csv(csv_path)
     polys = []
     for name, grp in df.groupby("ROI_Name"):
         coords = list(zip(grp["X_base"], grp["Y_base"]))
         polys.append(Polygon(coords))
+    return unary_union(polys)
+"""
+
+def load_qupath_rois(csv_path: str) -> MultiPolygon:
+    """
+    Load QuPath-exported CSV and return a unified Shapely polygon (possibly MultiPolygon).
+    Column names are matched case-insensitively: roi_name, x_base, y_base.
+    """
+    df = pd.read_csv(csv_path)
+
+    # Normalize headers, then use exact expected keys
+    df.columns = df.columns.str.strip().str.lower()
+
+    required = {"roi_name", "x_base", "y_base"}
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(
+            f"Missing required columns {sorted(missing)} in '{csv_path}'. "
+            f"Found columns: {list(df.columns)}"
+        )
+
+    polys = []
+    for _, grp in df.groupby("roi_name"):
+        coords = list(zip(grp["x_base"], grp["y_base"]))
+        polys.append(Polygon(coords))
+
     return unary_union(polys)

@@ -13,6 +13,7 @@ import sys
 import logging
 import argparse
 import torch
+import os
 
 from pathbench.experiment import Experiment
 
@@ -47,8 +48,13 @@ file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-# Silence overly‐chatty libraries if you like
-logging.getLogger("VIPS").setLevel(logging.WARNING)
+# if the cluster set this, it can force info logs on — nuke it:
+os.environ.pop("VIPS_INFO", None)
+
+# silence pyvips logs
+pyvips_logger = logging.getLogger("pyvips")
+pyvips_logger.setLevel(logging.WARNING)     # or logging.ERROR / logging.CRITICAL
+pyvips_logger.propagate = False             # belt-and-suspenders
 
 def main(config_path):
     """"

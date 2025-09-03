@@ -145,6 +145,7 @@ def perform_tile_extraction(config, project, combination_dict):
             report=config['experiment']['report'],
             roi_method= roi_method,
             roi_filter_method= roi_filter,
+            max_downsample = 4
         )
     except Exception as e:
         logging.error(f"Tile extraction failed: {e}")
@@ -197,46 +198,21 @@ def perform_feature_extraction(config, project, all_data, combination_dict, stri
 
 def create_slide_mosaic(config, all_data, method, percentile, mosaics_base, features_folder_path, patch_size):
     """
-    Generate patch mosaics for each slide using a specified patch selection method.
-
-    For each slide:
-      - If both the full-patch PKL and the mosaic PKL already exist, skips processing.
-      - Otherwise, loads or builds the full-patch dictionary (from TFRecord and feature files).
-      - Applies the chosen patch selection function to pick a subset of patches.
-      - Saves the selected subset as a new mosaic PKL.
-
-    Args:
-        config (dict):
-            Experiment configuration dictionary.
-        all_data (sf.Dataset):
-            Slideflow dataset object providing TFRecord file paths.
-        method (str):
-            Name of the patch selection method to apply (e.g. "splice_rgb", "yottixel").
-        percentile (float or None):
-            Selection threshold for the method (e.g. percentile for SPLICE/Yottixel);
-            use `None` to select all patches.
-        mosaics_base (str):
-            Directory under which full-patch PKLs are stored (must already exist).
-        features_folder_path (str):
-            Directory containing per-slide feature files (.pt and .index.npz).
-        patch_size (int):
-            Size of each tile in pixels, used for spatial matching against feature indices.
-
-    Returns:
-        dict:
-            A mapping from slide ID (str) to the filepath (str) of the saved mosaic PKL
-            containing only the selected patch subset.
+    Single-process mosaic creation (kept for convenience).
+    Updated to handle selectors that return:
+        selected, group_ids, coords, groups
+    and to persist .npz + _groups.json like the MP version.
     """
+    logging.info("Running mosaic creation using method=%s", method)
 
-    # resolve the function as before…
+    # Resolve selection function
     method_fn = f"{method.lower()}_patch_selection"
     patch_selection_fn = getattr(patch_selection_module, method_fn)
 
     slide_mosaic_paths = {}
     mosaic_failures = {}
 
-    # append roi‐flag to filename only
-    patches_pkl_folder = os.path.join(mosaics_base, f"patches")
+    patches_pkl_folder = os.path.join(mosaics_base, "patches")
     os.makedirs(patches_pkl_folder, exist_ok=True)
 
     pct_str = "all" if percentile is None else str(percentile)
@@ -245,53 +221,78 @@ def create_slide_mosaic(config, all_data, method, percentile, mosaics_base, feat
     os.makedirs(mosaic_folder, exist_ok=True)
 
     for tfr_path in tqdm(all_data.tfrecords(), desc="Processing slides", file=sys.stdout):
-        slide_id = sf.TFRecord(tfr_path)[0].get("slide", os.path.basename(tfr_path))
+        # Avoid opening TFRecord (no leak); derive id from filename
+        slide_id = os.path.splitext(os.path.basename(tfr_path))[0]
 
-        # ---- Paths to the **patch** dictionary dump ----
-        patches_pkl = os.path.join(patches_pkl_folder, f"{slide_id}.pkl")
-
-        # ---- Paths to the **feature** files ----
+        # Feature file paths
         feats_pt  = os.path.join(features_folder_path, f"{slide_id}.pt")
         feats_idx = os.path.join(features_folder_path, f"{slide_id}.index.npz")
-
         if not os.path.exists(feats_pt) or not os.path.exists(feats_idx):
             raise FileNotFoundError(f"Missing features for slide {slide_id}: {feats_pt}, {feats_idx}")
 
-        # ---- Load or build the patches pickle ----
+        # Patch dump
+        patches_pkl = os.path.join(patches_pkl_folder, f"{slide_id}.pkl")
         if os.path.exists(patches_pkl) and os.path.getsize(patches_pkl) > 0:
             patch_data = load_patch_dicts_pickle(patches_pkl, reconstruct_features=True)
         else:
-            # First try with ROI if requested
             patch_data = load_patch_dicts_from_tfr(tfr_path, feats_idx, feats_pt, patch_size)
-
             if len(patch_data["patches"]) == 0:
-                logging.error(f"[NO PATCHES] slide '{slide_id}' has no patches even without ROI - skipping")
-                mosaic_failures.setdefault("no patches without ROI", []).append(slide_id)
+                logging.error(f"[NO PATCHES] slide '{slide_id}' has no patches — skipping")
+                mosaic_failures.setdefault("no_patches", []).append(slide_id)
                 continue
-
-            # save patch dump
             save_patch_dicts_pickle(patch_data, patches_pkl, compress=3)
 
-        # ---- Now pick your mosaic filename, including the same suffix ----
-        mosaic_pkl = os.path.join(mosaic_folder, f"{slide_id}.pkl")
+        mosaic_pkl    = os.path.join(mosaic_folder, f"{slide_id}.pkl")
+        patch_ids_npz = os.path.join(mosaic_folder, f"{slide_id}.npz")
+        groups_json   = os.path.join(mosaic_folder, f"{slide_id}_groups.json")
 
-        # ---- Run selection if needed ----
         if not (os.path.exists(mosaic_pkl) and os.path.getsize(mosaic_pkl) > 0):
-            selected = patch_selection_fn(config, patch_data["patches"], percentile)
-            subset  = [patch_data["patches"][i] for i in selected]
-            save_patch_dicts_pickle({"properties": patch_data["properties"], "patches": subset}, mosaic_pkl, compress=3)
+            # NEW API: 4-tuple
+            selected, group_ids, coords, groups = patch_selection_fn(
+                config, patch_data["patches"], percentile
+            )
 
-        slide_mosaic_paths[slide_id] = mosaic_pkl  # key by base_id, value is the correct ROI vs no-ROI file
-    
-    # ---- write ROI failures out to disk ----
+            # Robust fallbacks (in case any selector returns None)
+            import numpy as np
+            N_all = len(patch_data["patches"])
+            if group_ids is None or (isinstance(group_ids, np.ndarray) and group_ids.size == 0):
+                group_ids = np.zeros(N_all, dtype=int)
+            if coords is None or (isinstance(coords, np.ndarray) and coords.size == 0):
+                coords = np.array([[int(p['loc'][0]), int(p['loc'][1])] for p in patch_data["patches"]], dtype=int)
+            if not groups:
+                # compact groups from group_ids
+                uniq, inv = np.unique(group_ids, return_inverse=True)
+                groups = {int(g): np.where(inv == idx)[0].tolist() for idx, g in enumerate(uniq)}
+
+            # Save subset pkl
+            subset = [patch_data["patches"][i] for i in selected]
+            save_patch_dicts_pickle(
+                {"properties": patch_data["properties"], "patches": subset},
+                mosaic_pkl,
+                compress=3
+            )
+
+            # Keep legacy key names for downstream code
+            np.savez_compressed(patch_ids_npz, bin_ids=group_ids, coords=coords)
+
+            # Persist groups for viz/QA
+            try:
+                groups_for_json = {int(g): [int(x) for x in members] for g, members in groups.items()}
+                with open(groups_json, "w") as f:
+                    json.dump(groups_for_json, f)
+            except Exception as e:
+                logging.warning(f"Could not save groups for {slide_id}: {e}")
+
+        slide_mosaic_paths[slide_id] = mosaic_pkl
+
     if mosaic_failures:
         out_path = os.path.join(patches_pkl_folder, "roi_failures.json")
         with open(out_path, 'w') as f:
             json.dump(mosaic_failures, f, indent=2)
-
         logging.info(f"Saved ROI failures for {len(mosaic_failures)} slides to {out_path}")
 
     return slide_mosaic_paths
+
 
 def make_patch_mosaic(
     args
@@ -328,11 +329,16 @@ def make_patch_mosaic(
         save_patch_dicts_pickle(patch_data, patches_pkl, compress=3)
 
     # ---- 2) Build the mosaic filename & run selection if needed ----
-    mosaic_pkl = os.path.join(mosaic_folder, f"{slide_id}.pkl")
-    patch_ids_npz = os.path.join(mosaic_folder, f"{slide_id}.npz")
+    mosaic_pkl     = os.path.join(mosaic_folder, f"{slide_id}.pkl")
+    patch_ids_npz  = os.path.join(mosaic_folder, f"{slide_id}.npz")
+    groups_json    = os.path.join(mosaic_folder, f"{slide_id}_groups.json")  # optional
 
     if not (os.path.exists(mosaic_pkl) and os.path.getsize(mosaic_pkl) > 0):
-        selected, patch_ids, coords = patch_selection_fn(config, patch_data["patches"], percentile)
+        # NEW: selectors now return 4 items
+        selected, group_ids, coords, groups = patch_selection_fn(
+            config, patch_data["patches"], percentile
+        )
+
         subset = [patch_data["patches"][i] for i in selected]
 
         save_patch_dicts_pickle(
@@ -341,7 +347,17 @@ def make_patch_mosaic(
             compress=3
         )
 
-        np.savez_compressed(patch_ids_npz, bin_ids=patch_ids, coords=coords)
+        # Keep existing key names so downstream code doesn’t break
+        np.savez_compressed(patch_ids_npz, bin_ids=group_ids, coords=coords)
+
+        # Optional but recommended: persist groups for later visualization/QA
+        try:
+            # convert np.ndarray -> list for JSON
+            groups_for_json = {int(g): [int(x) for x in idxs] for g, idxs in groups.items()}
+            with open(groups_json, "w") as f:
+                json.dump(groups_for_json, f)
+        except Exception as e:
+            logging.warning(f"Could not save groups for {slide_id}: {e}")
 
     return (slide_id, mosaic_pkl, None)
 
@@ -503,40 +519,10 @@ def create_slide_feature_paths(
     ext: str = ".pt",
     strict: bool = False
 ):
-    """
-    Build a dict mapping slide_id -> feature tensor path for slide-level models.
-
-    This mirrors the output shape of `create_slide_mosaic_mp`, but we only
-    verify that the feature file exists—no patch selection is performed.
-
-    Parameters
-    ----------
-    config : dict
-        Experiment config (only used for logging consistency here).
-    all_data : sf.Dataset
-        Slideflow dataset returned by `project.dataset(...)`.
-    features_folder_path : str
-        Directory containing the slide-level feature files.
-    ext : str
-        Extension of the feature files (default: '.pt').
-    strict : bool
-        If True, raise FileNotFoundError when a slide is missing a feature.
-        If False, log a warning and skip missing slides.
-
-    Returns
-    -------
-    slide_representation_paths : Dict[str, str]
-        slide_id -> absolute feature path
-    missing : List[str]
-        slide_ids without a corresponding feature file
-    """
     slide_representation_paths = {}
 
-    # Iterate exactly like in create_slide_mosaic_mp (over TFRecords)
     for tfr_path in tqdm(all_data.tfrecords(), desc="Scanning slides for features", file=sys.stdout):
-        # Keep slide_id derivation consistent with the rest of the pipeline
-        rec = sf.TFRecord(tfr_path)[0]
-        slide_id = rec.get("slide", os.path.splitext(os.path.basename(tfr_path))[0])
+        slide_id = os.path.splitext(os.path.basename(tfr_path))[0]  # no TFRecord open
 
         feat_path = os.path.join(features_folder_path, f"{slide_id}{ext}")
         if os.path.exists(feat_path) and os.path.getsize(feat_path) > 0:
@@ -545,7 +531,6 @@ def create_slide_feature_paths(
             logger.warning(f"Features are missing for slide {slide_id}")
 
     logger.info("Collected %d slide-level feature paths.", len(slide_representation_paths))
-
     return slide_representation_paths
 
 def benchmark_sis(config, project):

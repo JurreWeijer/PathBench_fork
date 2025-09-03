@@ -934,17 +934,17 @@ def generate_bags(config: dict, project: sf.Project, all_data: sf.Dataset,
     #If some bags are missing, recalculate them
     if "mixed_precision" in config['experiment']:
         bags = project.generate_feature_bags(model=feature_extractor, dataset=all_data,
-                                            normalizer=combination_dict['normalization'],
-                                            outdir=bags_dir,
-                                            mixed_precision=config['experiment']['mixed_precision'],
-                                            num_gpus=num_gpus,
-                                            force_regenerate=not config['experiment']['skip_feature_extraction'] if 'skip_feature_extraction' in config['experiment'] else True)
+                                             normalizer=combination_dict['normalization'],
+                                             outdir=bags_dir,
+                                             mixed_precision=config['experiment']['mixed_precision'],
+                                             num_gpus=num_gpus,
+                                             force_regenerate=not config['experiment']['skip_feature_extraction'] if 'skip_feature_extraction' in config['experiment'] else True)
     else:
         bags = project.generate_feature_bags(model=feature_extractor, dataset=all_data,
-                                            normalizer=combination_dict['normalization'],
-                                            outdir=bags_dir,
-                                            num_gpus=num_gpus,
-                                            force_regenerate=not config['experiment']['skip_feature_extraction'] if 'skip_feature_extraction' in config['experiment'] else True)
+                                             normalizer=combination_dict['normalization'],
+                                             outdir=bags_dir,
+                                             num_gpus=num_gpus,
+                                             force_regenerate=not config['experiment']['skip_feature_extraction'] if 'skip_feature_extraction' in config['experiment'] else True)
     return bags
 
 
