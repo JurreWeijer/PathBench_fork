@@ -121,54 +121,10 @@ def splice_rgb_patch_selection(config, patches, percentile_threshold):
             group_ids[idx] = gid
             groups[gid] = np.concatenate([groups[gid], [idx]])
 
-    # ---- Coords (prefer wsi_loc, fallback to loc, else [0,0]) ----
-    coords_list = []
-    for p in patches:
-        if 'wsi_loc' in p and p['wsi_loc'] is not None:
-            x, y = p['wsi_loc']
-        elif 'loc' in p and p['loc'] is not None:
-            x, y = p['loc']
-        else:
-            x, y = 0, 0
-        coords_list.append([int(x), int(y)])
-    coords = np.array(coords_list, dtype=int)
+    # ---- Coords ----
+    coords = np.array([[int(p['loc'][0]), int(p['loc'][1])] for p in patches], dtype=int)
 
     return selected, group_ids.astype(int), coords, groups
-
-    """
-    if percentile_threshold is None:
-        raise ValueError("percentile_threshold must be specified for SPLICE.")
-
-    # Extract color features (normalized RGB histograms)
-    color_features = np.array([patch['rgb_histogram'] for patch in patches])
-
-    num_patches = color_features.shape[0]
-    selected_indices = []
-    excluded = np.zeros(num_patches, dtype=bool)  # Tracks which patches are excluded
-
-    for i in range(num_patches):
-        if excluded[i]:
-            continue
-
-        ref_feat = color_features[i]
-        remaining_idx = np.where(~excluded)[0]  # Indices of remaining (not yet excluded) patches
-
-        # Compute distance from current patch to all others
-        distances = np.linalg.norm(color_features[remaining_idx] - ref_feat, axis=1)
-
-        # Determine suppression threshold based on percentile
-        thresh = np.percentile(distances, percentile_threshold)
-
-        # Exclude nearby redundant patches
-        for j, d in zip(remaining_idx, distances):
-            if j == i:
-                continue
-            if d < thresh:
-                excluded[j] = True
-
-        selected_indices.append(i)
-
-    return selected_indices, None, None"""
 
 def splice_features_patch_selection(config, patches, percentile_threshold):
     """
@@ -182,8 +138,9 @@ def splice_features_patch_selection(config, patches, percentile_threshold):
     A patch is only selected if it differs enough from previously selected ones.
 
     Args:
-        patches (list of dict): List of patch dictionaries, each containing:
-            - 'features': Deep feature embedding of the patch.
+        patches (list of dict): each with:
+        - 'feature': deep feature embedding (1D array)
+        - 'loc': (x, y) slide coordinates
         percentile_threshold (float): Percentile value (0-100) for distance suppression threshold.
 
     Returns:
@@ -258,53 +215,10 @@ def splice_features_patch_selection(config, patches, percentile_threshold):
             group_ids[idx] = gid
             groups[gid] = np.concatenate([groups[gid], [idx]])
 
-    # ---- Coords (prefer wsi_loc, fallback to loc, else [0,0]) ----
-    coords_list = []
-    for p in patches:
-        if 'wsi_loc' in p and p['wsi_loc'] is not None:
-            x, y = p['wsi_loc']
-        elif 'loc' in p and p['loc'] is not None:
-            x, y = p['loc']
-        else:
-            x, y = 0, 0
-        coords_list.append([int(x), int(y)])
-    coords = np.array(coords_list, dtype=int)
+    # ---- Coords ----
+    coords = np.array([[int(p['loc'][0]), int(p['loc'][1])] for p in patches], dtype=int)
 
     return selected, group_ids.astype(int), coords, groups
-
-    """if percentile_threshold is None:
-        raise ValueError("percentile_threshold must be specified for SPLICE.")
-
-    # Extract feature vectors from all patches
-    features = np.array([patch['feature'] for patch in patches])
-
-    num_patches = features.shape[0]
-    selected_indices = []
-    excluded = np.zeros(num_patches, dtype=bool)
-
-    for i in range(num_patches):
-        if excluded[i]:
-            continue
-
-        ref_feat = features[i]
-        remaining_idx = np.where(~excluded)[0]
-
-        # Compute distance from reference patch to remaining patches
-        distances = np.linalg.norm(features[remaining_idx] - ref_feat, axis=1)
-
-        # Compute suppression threshold based on user-defined percentile
-        thresh = np.percentile(distances, percentile_threshold)
-
-        # Exclude similar patches
-        for j, d in zip(remaining_idx, distances):
-            if j == i:
-                continue
-            if d < thresh:
-                excluded[j] = True
-
-        selected_indices.append(i)
-
-    return selected_indices, None, None"""
 
 def yottixel_rgb_patch_selection(config, patches, percentage_selected):	
     """
@@ -319,10 +233,10 @@ def yottixel_rgb_patch_selection(config, patches, percentage_selected):
     A fixed percentage of spatially diverse representatives is selected from each cluster.
 
     Args:
-        patches (list of dict): List of patch dictionaries, each containing:
-            - 'rgb_histogram': Normalized RGB histogram.
-            - 'wsi_loc': (x, y) location of the patch in the WSI.
-        percentage_selected (float): Percentage of patches to select from each color cluster.
+        patches (list of dict): each with:
+        - 'rgb_histogram': normalized RGB histogram (1D array)
+        - 'loc': (x, y) slide coordinates
+        percentage_selected (float):  Percentage of patches to select from each color cluster.
 
     Returns:
         list: Indices of selected patches from the input list.
@@ -361,7 +275,7 @@ def yottixel_rgb_patch_selection(config, patches, percentage_selected):
         cluster_patches = [patches[i] for i in member_idx]
         n_select = max(1, int(len(cluster_patches) * percentage_selected / 100))
 
-        loc_features = [p['wsi_loc'] for p in cluster_patches]
+        loc_features = np.asarray([p['loc'] for p in cluster_patches], dtype=float)
         kmeans_loc = KMeans(
             n_clusters=n_select,
             random_state=config["experiment"].get("random_state", None)
@@ -379,47 +293,9 @@ def yottixel_rgb_patch_selection(config, patches, percentage_selected):
                     break
 
     # ---- Coords alongside groups ----
-    coords = np.array([[int(p['wsi_loc'][0]), int(p['wsi_loc'][1])] for p in patches], dtype=int)
+    coords = np.array([[int(p['loc'][0]), int(p['loc'][1])] for p in patches], dtype=int)
 
     return selected, group_ids.astype(int), coords, groups
-
-    """kmeans_clusters = 9  # TODO: move to config if needed
-
-    if len(patches) == 0:
-        logging.warning("Empty patch list provided to Yottixel selection.")
-        return []
-
-    # ---- Stage 1: Color clustering ----
-    rgb_hist = np.array([p['rgb_histogram'] for p in patches])
-    kmeans_clusters = min(kmeans_clusters, len(patches))  # Cap clusters to number of patches
-    kmeans_color = KMeans(n_clusters=kmeans_clusters, random_state=config["experiment"].get("random_state", None))
-    color_labels = kmeans_color.fit_predict(rgb_hist)
-
-    selected_indices = []
-    for i in range(kmeans_clusters):
-        # Get all patches belonging to color cluster i
-        cluster_patches = [p for p, lbl in zip(patches, color_labels) if lbl == i]
-        if len(cluster_patches) == 0:
-            continue
-
-        n_select = max(1, int(len(cluster_patches) * percentage_selected / 100))
-
-        # ---- Stage 2: Spatial clustering ----
-        loc_features = [p['wsi_loc'] for p in cluster_patches]
-        kmeans_loc = KMeans(n_clusters=n_select, random_state=config["experiment"].get("random_state", None))
-        dists = kmeans_loc.fit_transform(loc_features)
-
-        used = set()
-        for idx in range(n_select):
-            # For each cluster center, find closest unused patch
-            sorted_idx = np.argsort(dists[:, idx])
-            for sidx in sorted_idx:
-                if sidx not in used:
-                    used.add(sidx)
-                    selected_indices.append(patches.index(cluster_patches[sidx]))
-                    break
-
-    return selected_indices, None, None"""
 
 def yottixel_features_patch_selection(config, patches, percentage_selected):
     """
@@ -434,9 +310,9 @@ def yottixel_features_patch_selection(config, patches, percentage_selected):
     patches, ensuring a mosaic that reflects both semantic and spatial variance.
 
     Args:
-        patches (list of dict): List of patch dictionaries, each containing:
-            - 'features': Deep feature embedding of the patch.
-            - 'wsi_loc': (x, y) location of the patch in the WSI.
+        patches (list of dict): each with:
+        - 'feature': deep feature embedding (1D array)
+        - 'loc': (x, y) slide coordinates
         percentage_selected (float): Percentage of patches to select from each feature cluster.
 
     Returns:
@@ -486,7 +362,7 @@ def yottixel_features_patch_selection(config, patches, percentage_selected):
             continue
 
         # ---- Stage 2: Spatial clustering ----
-        locs = np.array([p['wsi_loc'] for p in cluster_patches])
+        locs = np.asarray([p['loc'] for p in cluster_patches], dtype=float)
         kmeans_loc = KMeans(
             n_clusters=n_select,
             random_state=config["experiment"].get("random_state", None)
@@ -504,54 +380,10 @@ def yottixel_features_patch_selection(config, patches, percentage_selected):
                     selected.append(member_idx[sidx].item())
                     break
 
-    # ---- Coords alongside groups (use wsi_loc as in your method) ----
-    coords = np.array([[int(p['wsi_loc'][0]), int(p['wsi_loc'][1])] for p in patches], dtype=int)
+    # ---- Coords alongside groups ----
+    coords = np.array([[int(p['loc'][0]), int(p['loc'][1])] for p in patches], dtype=int)
 
     return selected, group_ids.astype(int), coords, groups
-
-    """
-    if len(patches) == 0:
-        logging.warning("Empty patch list provided.")
-        return []
-    
-    kmeans_clusters = 9  # TODO: move to config if needed
-
-    # ---- Stage 1: Feature clustering ----
-    features = np.array([p['feature'] for p in patches])
-    kmeans_clusters = min(kmeans_clusters, len(patches))
-    kmeans_feat = KMeans(n_clusters=kmeans_clusters, random_state=config["experiment"].get("random_state", None))
-    feat_labels = kmeans_feat.fit_predict(features)
-
-    selected_indices = []
-    for i in range(kmeans_clusters):
-        cluster_patches = [p for p, label in zip(patches, feat_labels) if label == i]
-        if len(cluster_patches) == 0:
-            continue
-
-        n_select = max(1, int(len(cluster_patches) * percentage_selected / 100))
-
-        # If only one patch should be selected, skip spatial clustering
-        if n_select == 1:
-            selected_indices.append(patches.index(cluster_patches[0]))
-            continue
-
-        # ---- Stage 2: Spatial clustering ----
-        locs = np.array([p['wsi_loc'] for p in cluster_patches])
-        kmeans_loc = KMeans(n_clusters=n_select, random_state=config["experiment"].get("random_state", None))
-        dists = kmeans_loc.fit_transform(locs)
-
-        used = set()
-        for idx in range(n_select):
-            # For each cluster center, select the closest unused patch
-            sorted_idx = np.argsort(dists[:, idx])
-            for sidx in sorted_idx:
-                if sidx not in used:
-                    used.add(sidx)
-                    selected_indices.append(patches.index(cluster_patches[sidx]))
-                    break
-
-    return selected_indices, None, None
-    """
 
 def sdm_features_patch_selection(config, patches, percentage_selected=None):
     """
@@ -611,88 +443,3 @@ def sdm_features_patch_selection(config, patches, percentage_selected=None):
     coords = np.array([[int(p['loc'][0]), int(p['loc'][1])] for p in patches], dtype=int)
 
     return selected, group_ids, coords, groups
-
-"""def sdm_features_patch_selection(config, patches, percentile):
-
-    Selection of Distinct Morphologies (SDM)
-    ----------------------------------------
-    Unsupervisedly selects one patch per “distance bin” from the centroid of all
-    patch embeddings. By sampling uniformly across these bins, SDM ensures a mosaic
-    that captures the full spectrum of morphological variation in the slide.
-
-    Computes the Euclidean distance of each patch’s feature vector to the global
-    centroid, discretizes those distances into integer “bins,” and then picks one
-    representative patch from each bin via a reproducible random choice.
-
-    Args:
-        patches (list of dict):
-            List of patch dictionaries, each containing:
-              - 'feature': 1D numpy array embedding of the patch.
-              - any other metadata (ignored here).
-        percentage_selected (float, optional):
-            Unused—present for interface consistency with other selectors.
-        random_state (int):
-            Seed for the random number generator to ensure reproducibility.
-
-    Returns:
-        list of int:
-            Indices of `patches` selected by SDM (one per distance bin).
-
-    Reference:
-        Shafique, Salman, et al.  
-        “Selection of Distinct Morphologies to Divide & Conquer Gigapixel Pathology Images.”  
-        Medical Image Analysis (2023). https://doi.org/10.1016/j.media.2023.101757
-
-    if not patches:
-        logging.warning("Empty patch list provided to SDM.")
-        return []
-
-    # ---- Stack features and compute centroid ----
-    feats = np.stack([p['feature'] for p in patches], axis=0)
-    centroid = feats.mean(axis=0)
-
-    # ---- Compute distances and discretize into integer bins ----
-    dists = np.linalg.norm(feats - centroid[None, :], axis=1)
-    bin_ids = np.rint(dists).astype(int)
-
-    # ---- Randomly pick one patch per bin ----
-    rng = np.random.default_rng(config["experiment"].get("random_state", None))
-    selected = []
-    for bin_id in np.unique(bin_ids):
-        candidates = np.where(bin_ids == bin_id)[0]
-        chosen = int(rng.choice(candidates))
-        selected.append(chosen)
-
-    coords = np.array([ [int(p['loc'][0]), int(p['loc'][1])] for p in patches ])
-
-    return selected, bin_ids, coords"""
-
-"""def splice_patch_selection(patches, features, percentile_threshold):
-    
-    logging.info("Starting SPLICE patch selection...")
-
-    if percentile_threshold is None: 
-        raise ValueError("percentile_threshold must be specified for SPLICE.")
-    
-    color_features = np.array([np.mean(p.reshape(-1, p.shape[-1]), axis=0) for p in patches])
-
-    num_patches = color_features.shape[0]
-    selected_indices = []
-    excluded = np.zeros(num_patches, dtype=bool)
-
-    for i in tqdm(range(num_patches), desc="SPLICE patch selection", leave=False):
-        if excluded[i]:
-            continue
-        ref_feat = color_features[i]
-        remaining_idx = np.where(~excluded)[0]
-        distances = np.linalg.norm(color_features[remaining_idx] - ref_feat, axis=1)
-        thresh = np.percentile(distances, percentile_threshold)
-        for j, d in zip(remaining_idx, distances):
-            if j == i:
-                continue
-            if d < thresh:
-                excluded[j] = True
-        selected_indices.append(i)
-    logging.info("SPLICE patch selection completed.")
-
-    return selected_indices"""

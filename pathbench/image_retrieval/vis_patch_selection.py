@@ -501,29 +501,32 @@ def generate_patch_selection_report_pdf(
     mosaic_method,
     pdf_base,
     patch_px,
-    patch_um, 
-    max_per_file: int = 200
+    patch_um
 ):
     """
-    Iterate over every slide_id → mosaic pickle, generate each visualization
-    (simple or extensive) and write them as pages in one or more PDFs,
-    using Pillow’s multi‐page PDF save.
+    Generate patch selection visualizations (simple or extensive) 
+    and export them to multi-page PDFs.
+
+    Configuration is taken from the `patch_cfg` dictionary, which should include:
+      - "mode": visualization style, "simple" or "extensive".
+      - "max_per_file" (optional): maximum slides per PDF (default 200).
 
     Args:
-        config:             Experiment configuration dict.
-        all_data:           slideflow.Project or Dataset for locating slides.
-        slide_mosaic_paths: Mapping slide_id → path to mosaic .pkl.
-        mosaic_method:      Name of the patch‐selection method.
-        pdf_base:           Base path (no extension) for output PDF(s).
-                            E.g. "/path/to/reports/patch_report"
-        max_per_file:       Maximum slides per PDF.
+        patch_cfg (dict): Settings from config["visualization"]["patch_selection"].
+        all_data (sf.Project): Project for locating slides.
+        slide_mosaic_paths (dict): Mapping slide_id → mosaic pickle path.
+        mosaic_method (str): Name of the patch selection method.
+        pdf_base (str): Base filename for output PDFs.
+        patch_px (int): Patch size in pixels.
+        patch_um (float): Patch size in microns.
     """
     # detect which mode to use
-    vizs = config["experiment"].get("visualization", [])
-    patch_vis = [v for v in vizs if v.startswith("patch_selection-")]
-    mode = (patch_vis[0].split("-",1)[1] if patch_vis else "simple")
-    if mode not in ("simple","extensive"):
-        mode = "simple"
+    patch_cfg = config.get("visualization", {}).get("patch_selection", {})
+    mode = patch_cfg.get("mode", "simple")
+    max_per_file = patch_cfg.get("max_per_file", 200)
+
+    if mode not in ("simple", "extensive"):
+        raise ValueError(f"Invalid patch_selection mode '{mode}'. Must be 'simple' or 'extensive'.")
 
     logging.info(f"Generating patch selection report in '{mode}' mode")
 

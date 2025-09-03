@@ -18,7 +18,7 @@ GRID_COLS   = 5
 GRID_ROWS   = 2        # always show up to 10 hits
 THUMB_SIZE  = 512      # image cell interior
 TEXT_H      = 40       # text band under query (unused for hits)
-HIT_TEXT_H  = 512       # text band under hits
+HIT_TEXT_H  = 256       # text band under hits
 CELL_W      = THUMB_SIZE
 CELL_H_HIT  = THUMB_SIZE + HIT_TEXT_H
 BORDER_PX   = 2
@@ -172,6 +172,8 @@ def visualize_retrieval_result(
     with both query and hit metadata constrained in height. When text exceeds available
     vertical space, it is truncated and an ellipsis ("…") is appended as the last line.
     """
+    rr_cfg = config.get("visualization", {}).get("retrieval_report", {})
+    include_metadata = rr_cfg.get("include_metadata", True)
 
     # 1) unpack
     qid    = result["query_slide_id"]
@@ -210,7 +212,10 @@ def visualize_retrieval_result(
     ] = qp
 
     # 6) draw metadata text in the right panel (wrap width + cap height with ellipsis)
-    qlines = get_metadata_lines(config, qid, qpath, qlab)
+    if include_metadata:
+        qlines = get_metadata_lines(config, qid, qpath, qlab)
+    else:
+        qlines = [f"Slide: {qid}", f"Label: {qlab}"]
     (_, txt_h), _ = cv2.getTextSize("Ay", FONT, FONT_SCALE, THICKNESS)
     line_sp = 5
 
@@ -251,7 +256,10 @@ def visualize_retrieval_result(
         hid   = hit["slide_id"]
         hlab  = hit["label"]
         hpath = all_data.find_slide(slide=hid)
-        lines = get_metadata_lines(config, hid, hpath, hlab)
+        if include_metadata:
+            lines = get_metadata_lines(config, hid, hpath, hlab)
+        else:
+            lines = [f"Slide: {hid}", f"Label: {hlab}"]
 
         wrapped = _wrap_lines(lines, max_text_w_hit, FONT, FONT_SCALE, THICKNESS)
 

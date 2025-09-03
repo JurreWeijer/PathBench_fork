@@ -496,13 +496,20 @@ def benchmark_sis(config, project):
     logging.info(f"Total number of combinations: {len(all_combinations)}")
     benchmark_parameters = config['benchmark_parameters']
 
-    resume_mode = config['experiment'].get('resume','from_beginning')
+    resume_flag = bool(config['experiment'].get('resume', False))
     checkpoint_path = os.path.join(project_dir, 'completed_combinations.json')
-    if resume_mode == 'continue' and os.path.exists(checkpoint_path):
-        with open(checkpoint_path,'r') as f:
+
+    if resume_flag and os.path.exists(checkpoint_path):
+        with open(checkpoint_path, 'r') as f:
             completed = set(json.load(f))
+        logging.info(f"Resuming from checkpoint with {len(completed)} completed combinations.")
     else:
         completed = set()
+        if resume_flag:
+            logging.warning("Resume=True but no checkpoint file found — starting from scratch.")
+    
+    # ---- Get visualization config ----
+    visualization_cfg = config.get("visualization", {})
 
     # ---- Iterate over each configuration ----
     for combination in all_combinations:
@@ -567,7 +574,7 @@ def benchmark_sis(config, project):
             else:
                 pdf_base = os.path.join(vis_base, f"mosaics_{mosaic_method}_{tile_string}")
 
-            if config['experiment']['report']:
+            if "patch_selection" in visualization_cfg:
                 try:
                     generate_patch_selection_report_pdf(
                         config=config,
@@ -589,14 +596,16 @@ def benchmark_sis(config, project):
             logging.info(f"Found slide-level features for {len(slide_representation_paths)} slides in {features_folder_path}")
 
         # ---- Generate UMAP plots (if requested) ----
-        umap_base = os.path.join(vis_base, f"umap_{mosaic_method}_{feature_string}")
-
-        if any(viz.startswith("UMAP") for viz in config["experiment"].get("visualization", [])):
+        if "umap" in visualization_cfg:
+            umap_base = os.path.join(vis_base, f"umap_{mosaic_method}_{feature_string}")
+            umap_cfg = visualization_cfg["umap"]
             run_umap_visualizations(
-                config=config, 
-                slide_representation_paths=slide_representation_paths, 
-                mosaic_method=mosaic_method, 
-                output_base=umap_base
+                umap_cfg=umap_cfg,
+                slide_representation_paths=slide_representation_paths,
+                mosaic_method=mosaic_method,
+                output_base=umap_base,
+                annotation_file=config["experiment"]["annotation_file"],
+                random_state=config["experiment"].get("random_state", None)
             )
 
         # ---- Similar Image Search Benchmark ----
@@ -630,17 +639,20 @@ def benchmark_sis(config, project):
             output_path=os.path.join(combo_eval_folder, f"retrieval_results.xlsx")
         )
 
-        if config['experiment']['report']:
+        if "retrieval_report" in visualization_cfg:
             try:
                 generate_image_retrieval_report_pdf(
                     config=config,
                     results=results,
                     all_data=all_data,
-                    output_dir=combo_eval_folder,   
+                    output_dir=combo_eval_folder
                 )
             except Exception as e:
-                logging.warning(f"Retrieval visualization failed for {search_method}_{mosaic_method}_{feature_string}: {e}")
+                logging.warning(
+                    f"Retrieval visualization failed for {search_method}_{mosaic_method}_{feature_string}: {e}"
+                )
 
+            logging.info("Image retrieval visualizations saved to PDF.")
         # ---- Metric Evaluation ----
         raw_metrics = config['experiment'].get("evaluation", []) or []
         valid_metrics = [m for m in raw_metrics if re.match(r'^(hit|mmv|map)_at_\d+$', m)]
