@@ -77,6 +77,9 @@ from ..image_retrieval.vis_patch_selection import generate_patch_selection_repor
 from ..image_retrieval.evaluation import evaluate_retrieval_metrics, parse_metric_names
 from ..image_retrieval.vis_retrieval_results import generate_image_retrieval_report_pdf
 from ..image_retrieval.vis_umap import run_umap_visualizations
+from ..image_retrieval.patch_selectors import splice, yottixel, sdm  
+
+from ..image_retrieval.patch_selectors.registry import build_patch_selector, get_selector_param_key
 
 import slideflow as sf
 from slideflow.model import build_feature_extractor
@@ -196,22 +199,16 @@ def perform_feature_extraction(config, project, all_data, combination_dict, stri
 
     return bags
 
-def make_patch_mosaic(
-    args
-):
+def make_patch_mosaic(args):
     """
     Worker function (runs in a separate process) to build a single slide's mosaic.
     Expects a tuple of:
       (slide_id, tfr_path, feats_pt, feats_idx, patches_pkl_folder,
-       mosaic_folder, roi, patch_size, method, percentile, config)
+       mosaic_folder, patch_size, method, percentile, config, selector_kwargs)
     """
     (slide_id, tfr_path, feats_pt, feats_idx,
      patches_pkl_folder, mosaic_folder,
-     patch_size, method, percentile, config) = args
-
-    # --- Resolve selection function ---
-    method_fn = f"{method.lower()}_patch_selection"
-    patch_selection_fn = getattr(patch_selection_module, method_fn)
+     patch_size, method, percentile, config) = args  
 
     # ---- Paths to the **patch** dictionary dump ----
     patches_pkl = os.path.join(patches_pkl_folder, f"{slide_id}.pkl")
@@ -221,13 +218,9 @@ def make_patch_mosaic(
         patch_data = load_patch_dicts_pickle(patches_pkl, reconstruct_features=True)
     else:
         patch_data = load_patch_dicts_from_tfr(tfr_path, feats_idx, feats_pt, patch_size)
-
-        # If STILL zero patches, skip entirely
         if len(patch_data["patches"]) == 0:
             logging.error(f"[NO PATCHES] '{slide_id}' has no patches — skipping")
             return (slide_id, None, "no_patches")
-
-        # Save the patch dump for future invocations
         save_patch_dicts_pickle(patch_data, patches_pkl, compress=3)
 
     # ---- 2) Build the mosaic filename & run selection if needed ----
@@ -236,9 +229,17 @@ def make_patch_mosaic(
     groups_json    = os.path.join(mosaic_folder, f"{slide_id}_groups.json")  # optional
 
     if not (os.path.exists(mosaic_pkl) and os.path.getsize(mosaic_pkl) > 0):
-        # NEW: selectors now return 4 items
-        selected, group_ids, coords, groups = patch_selection_fn(
-            config, patch_data["patches"], percentile
+        # Build selector in the worker (don’t pickle instances across processes)
+        patch_selector = build_patch_selector(method, config)
+        selector_kwargs = {}
+        param_key = get_selector_param_key(method)
+        if param_key is not None and percentile is not None:
+            selector_kwargs[param_key] = percentile
+
+        # Run selection (kwargs may be empty for methods without a param)
+        selected, group_ids, coords, groups = patch_selector.run(
+            patch_data["patches"],
+            **(selector_kwargs or {})
         )
 
         subset = [patch_data["patches"][i] for i in selected]
@@ -249,12 +250,9 @@ def make_patch_mosaic(
             compress=3
         )
 
-        # Keep existing key names so downstream code doesn’t break
         np.savez_compressed(patch_ids_npz, bin_ids=group_ids, coords=coords)
 
-        # Optional but recommended: persist groups for later visualization/QA
         try:
-            # convert np.ndarray -> list for JSON
             groups_for_json = {int(g): [int(x) for x in idxs] for g, idxs in groups.items()}
             with open(groups_json, "w") as f:
                 json.dump(groups_for_json, f)
