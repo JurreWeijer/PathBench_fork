@@ -1,9 +1,12 @@
 import os
 import re
-import pandas as pd
 import logging
 
+from difflib import get_close_matches
+
 from .mosaic_selectors.registry import list_mosaic_selectors, get_selector_param_key
+from .search_methods.registry import list_search_methods, get_search_method_supports
+from slideflow_fork.slideflow.model.extractors._registry import list_extractors as sf_list_extractors, is_extractor as sf_is_extractor
 
 logger = logging.getLogger(__name__)
 
@@ -14,19 +17,6 @@ class SISConfigValidator:
     ALLOWED_VIZ_METHODS = {"umap-mean", "umap-median", "umap-none", "patch_selection-extensive", "patch_selection-simple"}
     ALLOWED_UMAP_KEYS = {"n_neighbors", "min_dist", "metric"}
     ALLOWED_NORMALIZATIONS = {"reinhard", "macenko", "cyclegan"}
-
-    PATCH_FEATURE_EXTRACTORS = {"resnet50_imagenet", "ctranspath", "transpath_mocov3", "retccl",
-        "plip", "histossl", "uni", "uni_h", "conch", "dino", "mocov2",
-        "swav", "phikon", "phikon_v2", "gigapath", "barlow_twins", "hibou_b",
-        "hibou_l", "pathoduet_ihc", "pathoduet_he", "kaiko_s8", "kaiko_s16",
-        "kaiko_b8", "kaiko_b16", "kaiko_l14", "h_optimus_0", "h_optimus_1",
-        "virchow", "virchow2", "exaone_path"}
-    SLIDE_FEATURE_EXTRACTORS = {"titan_slide", "gigapath_slide", "prism_slide"}
-    ALLOWED_FEATURE_EXTRACTORS = PATCH_FEATURE_EXTRACTORS | SLIDE_FEATURE_EXTRACTORS
-
-    PATCH_SEARCH_METHODS = {"yottixel", "sish", "retccl"}
-    SLIDE_SEARCH_METHODS = {"yottixel"}
-    ALLOWED_SEARCH_METHODS = PATCH_SEARCH_METHODS | SLIDE_SEARCH_METHODS
 
     METRIC_PATTERN = re.compile(r"^(hit|mmv|map)_at_\d+$", re.IGNORECASE)
 
@@ -194,15 +184,33 @@ class SISConfigValidator:
                 self.errors.append(f"Unknown normalization: {norm}")
 
         # feature_extraction (case‐insensitive)
-        for fe in bp.get("feature_extraction", []):
-            if fe.lower() not in self.ALLOWED_FEATURE_EXTRACTORS:
-                self.errors.append(f"Unsupported feature_extraction: {fe}")
+        available_extractors = sf_list_extractors()
+        for feature_extractor in bp.get("feature_extraction", []):
+            if not sf_is_extractor(feature_extractor):
+                # nice error with suggestions
+                sugg = get_close_matches(feature_extractor, available_extractors, n=3)
+                hint = f" Did you mean: {', '.join(sugg)}?" if sugg else ""
+                self.errors.append(
+                    f"Unsupported feature_extraction: {feature_extractor}.{hint} "
+                    f"Available: {sorted(available_extractors)}"
+                )
 
         # search_method
-        for sm in bp.get("search_method", []):
-            parts = sm.split("-",1)
-            if len(parts)!=2 or parts[0].lower() not in self.ALLOWED_SEARCH_METHODS or not parts[1].isdigit():
-                self.errors.append(f"Invalid search_method entry: {sm}")
+        available_methods = set(list_search_methods())
+        for search_method in bp.get("search_method", []):
+            parts = search_method.split("-", 1)
+            base = parts[0].lower()
+            kstr = parts[1] if len(parts) == 2 else None
+
+            if base not in available_methods:
+                self.errors.append(
+                    f"Unknown search_method '{base}'. Available: {sorted(available_methods)}"
+                )
+                continue
+
+            # keep your existing requirement that k is provided and numeric
+            if kstr is None or not kstr.isdigit():
+                self.errors.append(f"Invalid search_method entry (need '-<k>'): {search_method}")
 
         # mosaic_method
         available = set(list_mosaic_selectors())  # e.g. {'splice_rgb','splice_features','yottixel_rgb','yottixel_features','sdm_features'}
@@ -252,29 +260,25 @@ class SISConfigValidator:
         if not isinstance(hf,str) or not hf.strip():
             self.errors.append("`hf_key` must be a non-empty string")
 
-    def is_patch_model(self, extractor_name: str) -> bool:
-        """
-        Returns True if the given extractor is a patch‐level feature extractor.
-        """
-        return extractor_name in self.PATCH_FEATURE_EXTRACTORS
-
-    def is_slide_model(self, extractor_name: str) -> bool:
+    def is_slide_extractor(self, extractor_name: str) -> bool:
         """
         Returns True if the given extractor is a slide‐level feature extractor.
         """
-        return extractor_name in self.SLIDE_FEATURE_EXTRACTORS
+        return extractor_name.lower().endswith("_slide")
+    
+    def is_patch_extractor(self, extractor_name: str) -> bool:
+        """
+        Returns True if the given extractor is a patch‐level feature extractor.
+        """
+        return not self.is_slide_extractor(extractor_name)
 
     def is_patch_search(self, method: str) -> bool:
-        """
-        Returns True if the given search method operates at the patch level.
-        """
-        return method in self.PATCH_SEARCH_METHODS
+        supports = get_search_method_supports(method.lower())
+        return bool(supports and "patch" in supports)
 
     def is_slide_search(self, method: str) -> bool:
-        """
-        Returns True if the given search method operates at the slide level.
-        """
-        return method in self.SLIDE_SEARCH_METHODS
+        supports = get_search_method_supports(method.lower())
+        return bool(supports and "slide" in supports)
     
     def is_valid_combination(self, combo: dict) -> bool:
         """
@@ -286,7 +290,7 @@ class SISConfigValidator:
         search = combo.get("search_method", "").lower().split("-")[0]
 
         # patch‐level extractor must use a patch‐level search
-        if self.is_patch_model(feat) and not self.is_patch_search(search):
+        if self.is_patch_extractor(feat) and not self.is_patch_search(search):
             self._combination_error = (
                 f"Extractor '{feat}' is patch‐level, but search method '{search}' "
                 "is not patch‐level."
@@ -294,7 +298,7 @@ class SISConfigValidator:
             return False
 
         # slide‐level extractor must use a slide‐level search
-        if self.is_slide_model(feat) and not self.is_slide_search(search):
+        if self.is_slide_extractor(feat) and not self.is_slide_search(search):
             self._combination_error = (
                 f"Extractor '{feat}' is slide‐level, but search method '{search}' "
                 "is not slide‐level."

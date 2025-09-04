@@ -9,7 +9,7 @@ import os
 import gc
 import psutil
 
-from ..image_retrieval.utils import load_patch_dicts_pickle
+from ...image_retrieval.utils import load_patch_dicts_pickle
 
 def plot_slide_umap(
     annotation_file,

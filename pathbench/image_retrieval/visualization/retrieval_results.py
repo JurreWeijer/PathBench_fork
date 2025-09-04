@@ -11,7 +11,7 @@ from functools import lru_cache
 import re
 import unicodedata
 
-from .vis_utils import crop_roi, get_dataset_name_for_slide, get_path_from_dataset, load_qupath_rois, find_best_level
+from ...image_retrieval.visualization.utils import crop_roi, get_dataset_name_for_slide, get_path_from_dataset, load_qupath_rois, find_best_level
 
 # ─────────────────────────── Constants ────────────────────────────────────
 GRID_COLS   = 5

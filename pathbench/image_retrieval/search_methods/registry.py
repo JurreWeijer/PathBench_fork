@@ -1,6 +1,6 @@
 # registry.py
 from __future__ import annotations
-from typing import Dict, Type, Optional
+from typing import Dict, Type, Optional, Set
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,10 +22,25 @@ def register_search_methods(cls: Type):
     return cls
 
 def list_search_methods() -> list[str]:
+    _autoload_all_search_methods()          # ensure everything is loaded
     return sorted(_search_methods.keys())
 
 def has_search_method(name: str) -> bool:
+    _autoload_all_search_methods()
     return name.lower() in _search_methods
+
+def get_search_method_supports(name: str) -> Optional[Set[str]]:
+    """
+    Return the declared supported modes for a search method (e.g., {'patch'}, {'slide'}, or both).
+    None if the method is unknown.
+    """
+    _autoload_all_search_methods()
+    cls = _search_methods.get(name.lower())
+    if cls is None:
+        return None
+    supports = getattr(cls, "supports", set())
+    # normalize and return a plain set of lowercase strings
+    return {str(s).lower() for s in supports}
 
 def build_search_method(name: str, **kwargs):
     _autoload_all_search_methods()  # ensure everything is imported before lookup

@@ -70,10 +70,10 @@ from ..benchmarking.benchmark import calculate_combinations, generate_bags
 from ..utils.utils import free_up_gpu_memory
 from ..image_retrieval.config_validator import SISConfigValidator
 from ..image_retrieval.utils import load_patch_dicts_from_tfr, load_patch_dicts_pickle, save_patch_dicts_pickle, save_retrieval_metrics, save_retrieval_results_to_excel, log_mem, cleanup_dev_shm
-from ..image_retrieval.vis_patch_selection import generate_patch_selection_report_pdf
+from ..image_retrieval.visualization.mosaic_selection import generate_mosaic_selection_report_pdf
 from ..image_retrieval.evaluation import evaluate_retrieval_metrics, parse_metric_names
-from ..image_retrieval.vis_retrieval_results import generate_image_retrieval_report_pdf
-from ..image_retrieval.vis_umap import run_umap_visualizations
+from ..image_retrieval.visualization.retrieval_results import generate_image_retrieval_report_pdf
+from ..image_retrieval.visualization.umap import run_umap_visualizations
 from ..image_retrieval.mosaic_selectors import splice, yottixel, sdm  
 from ..image_retrieval.mosaic_selectors.registry import build_mosaic_selector, get_selector_param_key
 from ..image_retrieval.search_methods.registry import build_search_method, list_search_methods
@@ -538,7 +538,7 @@ def benchmark_sis(config, project):
             logging.info("No GPU detected. Skipping feature extraction and using precomputed features.") 
 
         # ---- Mosaic creation ----
-        if validator.is_patch_model(combination_dict.get("feature_extraction")):
+        if validator.is_patch_extractor(combination_dict.get("feature_extraction")):
             mosaic = combination_dict['mosaic_selector']
             if "-" in mosaic:
                 mosaic_selector, mosaic_percentile = mosaic.split("-")
@@ -571,7 +571,7 @@ def benchmark_sis(config, project):
 
             if "patch_selection" in visualization_cfg:
                 try:
-                    generate_patch_selection_report_pdf(
+                    generate_mosaic_selection_report_pdf(
                         config=config,
                         all_data=all_data,
                         slide_mosaic_paths=slide_representation_paths,
@@ -585,7 +585,7 @@ def benchmark_sis(config, project):
 
             logging.info("Mosaic patch visualizations saved to PDF.")
             del slide_mosaic_paths
-        elif validator.is_slide_model(combination_dict.get("feature_extraction")):
+        elif validator.is_slide_extractor(combination_dict.get("feature_extraction")):
             slide_representation_paths = create_slide_feature_paths(config, all_data, features_folder_path)
             mosaic_selector = "slide"
             logging.info(f"Found slide-level features for {len(slide_representation_paths)} slides in {features_folder_path}")
