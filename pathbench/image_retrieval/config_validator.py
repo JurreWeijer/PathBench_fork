@@ -3,6 +3,8 @@ import re
 import pandas as pd
 import logging
 
+from .mosaic_selectors.registry import list_mosaic_selectors, get_selector_param_key
+
 logger = logging.getLogger(__name__)
 
 class SISConfigValidator:
@@ -26,7 +28,6 @@ class SISConfigValidator:
     SLIDE_SEARCH_METHODS = {"yottixel"}
     ALLOWED_SEARCH_METHODS = PATCH_SEARCH_METHODS | SLIDE_SEARCH_METHODS
 
-    ALLOWED_MOSAIC_BASE = {"splice_rgb", "splice_features", "yottixel_rgb", "yottixel_features", "sdm_features"}
     METRIC_PATTERN = re.compile(r"^(hit|mmv|map)_at_\d+$", re.IGNORECASE)
 
     def __init__(self, config: dict):
@@ -204,34 +205,45 @@ class SISConfigValidator:
                 self.errors.append(f"Invalid search_method entry: {sm}")
 
         # mosaic_method
-        for mm in bp.get("mosaic_method", []):
-            parts = mm.split("-",1)
-            base, pct = (parts[0], parts[1]) if len(parts)==2 else (parts[0], None)
-            if base.lower() not in self.ALLOWED_MOSAIC_BASE:
-                self.errors.append(f"Unsupported mosaic_method base: {mm}")
-            if pct and pct.lower()!="none":
-                try:
-                    float(pct)
-                except:
-                    self.errors.append(f"Invalid mosaic percentile: {mm}")
+        available = set(list_mosaic_selectors())  # e.g. {'splice_rgb','splice_features','yottixel_rgb','yottixel_features','sdm_features'}
+        for mosaic_selector in bp.get("mosaic_selector", []):
+            parts = mosaic_selector.split("-", 1)
+            base = parts[0].lower()
+            suffix = parts[1] if len(parts) == 2 else None
+
+            if base not in available:
+                self.errors.append(
+                    f"Unsupported mosaic_method '{mosaic_selector}'. "
+                    f"Available: {sorted(available)}"
+                )
+                continue
+
+            param_key = get_selector_param_key(base)  # None for selectors without a numeric arg
+
+            if param_key is None:
+                # selector does not take a numeric parameter
+                if suffix and suffix.lower() != "none":
+                    logging.warning(
+                        f"Selector '{base}' takes no parameter; use '{base}' or '{base}-none', got '{mosaic_selector}'. (skipping strict validation)"
+                    )
+            else:
+                # selector expects a numeric parameter (e.g., percentage/percentile)
+                if suffix is None:
+                    self.errors.append(
+                        f"Selector '{base}' expects a '{param_key}' value (e.g., '{base}-30')."
+                    )
+                elif suffix.lower() == "none":
+                    self.errors.append(
+                        f"Selector '{base}' requires numeric '{param_key}', not 'none' (got '{mosaic_selector}')."
+                    )
+                else:
+                    try:
+                        float(suffix)
+                    except ValueError:
+                        self.errors.append(
+                            f"Invalid value for '{param_key}' in '{mosaic_selector}'; expected a number."
+                        )
         
-        #TODO: add a check if the most important ones are present
-
-        """if "roi" in bp:
-            roi_vals = bp["roi"]
-            # must be a list of bools
-            if not (isinstance(roi_vals, (list,tuple)) and all(isinstance(v,bool) for v in roi_vals)):
-                self.errors.append("`benchmark_parameters.roi` must be a list of booleans")
-            # if any experiment wants ROI=True, check that each dataset has a valid roi_path
-            if any(roi_vals):
-                datasets = self.cfg.get("datasets", [])
-                for idx, ds in enumerate(datasets):
-                    rp = ds.get("roi_path")
-                    if not rp:
-                        self.errors.append(f"[datasets][{idx}] missing `roi_path` but ROI=True requested")
-                    elif not os.path.isdir(rp):
-                        self.errors.append(f"[datasets][{idx}] `roi_path` does not exist: {rp!r}")"""
-
     def _validate_other(self):
         wd = self.cfg.get("weights_dir","")
         if not wd or not os.path.isdir(wd):

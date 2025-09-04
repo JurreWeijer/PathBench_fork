@@ -498,7 +498,7 @@ def generate_patch_selection_report_pdf(
     config,
     all_data,
     slide_mosaic_paths,
-    mosaic_method,
+    mosaic_selector,
     pdf_base,
     patch_px,
     patch_um
@@ -515,7 +515,7 @@ def generate_patch_selection_report_pdf(
         patch_cfg (dict): Settings from config["visualization"]["patch_selection"].
         all_data (sf.Project): Project for locating slides.
         slide_mosaic_paths (dict): Mapping slide_id → mosaic pickle path.
-        mosaic_method (str): Name of the patch selection method.
+        mosaic_selector (str): Name of the patch selection method.
         pdf_base (str): Base filename for output PDFs.
         patch_px (int): Patch size in pixels.
         patch_um (float): Patch size in microns.
@@ -568,7 +568,7 @@ def generate_patch_selection_report_pdf(
                     if img is None:
                         continue
 
-                    img = add_title(img, f"{slide_id} - {mosaic_method}")
+                    img = add_title(img, f"{slide_id} - {mosaic_selector}")
                     arr = np.array(img)
 
                     fig = plt.figure(figsize=(arr.shape[1]/100, arr.shape[0]/100), dpi=100)

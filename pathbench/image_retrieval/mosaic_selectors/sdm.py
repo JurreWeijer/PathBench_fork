@@ -1,12 +1,21 @@
+# ------------------------------------------------------------------------------
+# SDM (Selection of Distinct Morphologies):
+#   Source Paper:
+#     Shafique, A., Fröhlich, K., Alsaafin, A., et al.
+#     “Selection of Distinct Morphologies to Divide & Conquer Gigapixel Pathology Images.”
+#     Medical Image Analysis (2023). DOI:10.1016/j.media.2023.102123
+#   No official code release; reference implementation provided in this script.
+# ------------------------------------------------------------------------------
+
 import logging 
 import numpy as np
 from sklearn.cluster import KMeans
 
-from .base import PatchSelector
-from .registry import register_patch_selectors
+from .base import MosaicSelector
+from .registry import register_mosaic_selectors
 
-@register_patch_selectors
-class SDMFeatures(PatchSelector):
+@register_mosaic_selectors
+class SDMFeatures(MosaicSelector):
     name = "SDM_features"
 
     """

@@ -67,7 +67,6 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 from ..benchmarking.benchmark import calculate_combinations, generate_bags
 from ..utils.utils import free_up_gpu_memory
-import pathbench.image_retrieval.patch_selection as patch_selection_module
 from ..image_retrieval.yottixel_search import YottixelDatabase
 from ..image_retrieval.retccl_search import RetCCLDatabase
 from ..image_retrieval.sish_search import SISHDatabase
@@ -77,9 +76,9 @@ from ..image_retrieval.vis_patch_selection import generate_patch_selection_repor
 from ..image_retrieval.evaluation import evaluate_retrieval_metrics, parse_metric_names
 from ..image_retrieval.vis_retrieval_results import generate_image_retrieval_report_pdf
 from ..image_retrieval.vis_umap import run_umap_visualizations
-from ..image_retrieval.patch_selectors import splice, yottixel, sdm  
+from ..image_retrieval.mosaic_selectors import splice, yottixel, sdm  
 
-from ..image_retrieval.patch_selectors.registry import build_patch_selector, get_selector_param_key
+from ..image_retrieval.mosaic_selectors.registry import build_mosaic_selector, get_selector_param_key
 
 import slideflow as sf
 from slideflow.model import build_feature_extractor
@@ -208,7 +207,7 @@ def make_patch_mosaic(args):
     """
     (slide_id, tfr_path, feats_pt, feats_idx,
      patches_pkl_folder, mosaic_folder,
-     patch_size, method, percentile, config) = args  
+     patch_size, selector, percentile, config) = args  
 
     # ---- Paths to the **patch** dictionary dump ----
     patches_pkl = os.path.join(patches_pkl_folder, f"{slide_id}.pkl")
@@ -230,9 +229,9 @@ def make_patch_mosaic(args):
 
     if not (os.path.exists(mosaic_pkl) and os.path.getsize(mosaic_pkl) > 0):
         # Build selector in the worker (don’t pickle instances across processes)
-        patch_selector = build_patch_selector(method, config)
+        patch_selector = build_mosaic_selector(selector, config)
         selector_kwargs = {}
-        param_key = get_selector_param_key(method)
+        param_key = get_selector_param_key(selector)
         if param_key is not None and percentile is not None:
             selector_kwargs[param_key] = percentile
 
@@ -277,7 +276,7 @@ def make_slide_mosaic(
 
     (slide_id, tfr_path, feats_pt, feats_idx,
      patches_pkl_folder, mosaic_folder,
-     patch_size, method, percentile, config) = args
+     patch_size, selector, percentile, config) = args
     
     # 1) Load the feature tensor
     feats = torch.load(feats_pt)
@@ -320,7 +319,7 @@ def make_slide_mosaic(
 def create_slide_mosaic_mp(
     config,
     all_data,
-    method,
+    selector,
     percentile,
     mosaics_base,
     features_folder_path,
@@ -333,7 +332,7 @@ def create_slide_mosaic_mp(
     Returns:
         dict[slide_id → path_to_mosaic_pkl]
     """
-    logging.info(f"Running mosaic creation using method={method}")
+    logging.info(f"Running mosaic creation using method={selector}")
 
     # 1) Prepare all the base‐paths/folders
     slide_mosaic_paths = {}
@@ -345,11 +344,11 @@ def create_slide_mosaic_mp(
     pct_str = "all" if percentile is None else str(percentile) #TODO: all should not be added when there is no percentage
     features_suffix = (
         f"_{os.path.basename(os.path.normpath(features_folder_path))}"
-        if "features" in method.lower() else ""
+        if "features" in selector.lower() else ""
     )
     mosaic_folder = os.path.join(
         mosaics_base,
-        f"{method}_{pct_str}{features_suffix}"
+        f"{selector}_{pct_str}{features_suffix}"
     )
     os.makedirs(mosaic_folder, exist_ok=True)
 
@@ -383,7 +382,7 @@ def create_slide_mosaic_mp(
                     patches_pkl_folder,
                     mosaic_folder,
                     patch_size,
-                    method,
+                    selector,
                     percentile,
                     config
                 )
@@ -516,7 +515,7 @@ def benchmark_sis(config, project):
 
         # Strings used for filenames and identifiers
         tile_string = f"{combination_dict['tile_px']}px_{str(combination_dict['tile_um']) if str(combination_dict['tile_um']).endswith('x') else str(combination_dict['tile_um']) + 'x'}"
-        feature_string = "_".join([f"{value}" for key, value in combination_dict.items() if key not in ['mil', 'loss', 'augmentation', 'activation_function', 'optimizer', 'mosaic_method', 'search_method', 'roi']])
+        feature_string = "_".join([f"{value}" for key, value in combination_dict.items() if key not in ['mil', 'loss', 'augmentation', 'activation_function', 'optimizer', 'mosaic_selector', 'search_method', 'roi']])
         combo_id = "_".join([f"{value}" for key, value in combination_dict.items()])
 
         if not validator.is_valid_combination(combination_dict):
@@ -542,19 +541,19 @@ def benchmark_sis(config, project):
 
         # ---- Mosaic creation ----
         if validator.is_patch_model(combination_dict.get("feature_extraction")):
-            mosaic = combination_dict['mosaic_method']
+            mosaic = combination_dict['mosaic_selector']
             if "-" in mosaic:
-                mosaic_method, mosaic_percentile = mosaic.split("-")
+                mosaic_selector, mosaic_percentile = mosaic.split("-")
                 mosaic_percentile = None if mosaic_percentile.lower() == "none" else int(mosaic_percentile)
             else:
-                mosaic_method = mosaic
+                mosaic_selector = mosaic
                 mosaic_percentile = None
 
-            logging.info(f"Running {mosaic_method} patch selection...")
+            logging.info(f"Running {mosaic_selector} patch selection...")
             slide_mosaic_paths = create_slide_mosaic_mp(
                                         config=config, 
                                         all_data=all_data,
-                                        method=mosaic_method, 
+                                        selector=mosaic_selector, 
                                         percentile=mosaic_percentile, 
                                         mosaics_base=mosaics_base,
                                         features_folder_path=features_folder_path, 
@@ -567,10 +566,10 @@ def benchmark_sis(config, project):
             # ---- Patch visualization (multi-page PDF) ----
             logging.info("Creating mosaic patch visualizations...")
 
-            if "features" in mosaic_method:
-                pdf_base = os.path.join(vis_base, f"mosaics_{mosaic_method}_{tile_string}_{feature_string}")
+            if "features" in mosaic_selector:
+                pdf_base = os.path.join(vis_base, f"mosaics_{mosaic_selector}_{tile_string}_{feature_string}")
             else:
-                pdf_base = os.path.join(vis_base, f"mosaics_{mosaic_method}_{tile_string}")
+                pdf_base = os.path.join(vis_base, f"mosaics_{mosaic_selector}_{tile_string}")
 
             if "patch_selection" in visualization_cfg:
                 try:
@@ -578,29 +577,29 @@ def benchmark_sis(config, project):
                         config=config,
                         all_data=all_data,
                         slide_mosaic_paths=slide_representation_paths,
-                        mosaic_method=mosaic_method,
+                        mosaic_selector=mosaic_selector,
                         pdf_base=pdf_base,
                         patch_px=combination_dict["tile_px"],
                         patch_um=combination_dict['tile_um']
                     )
                 except Exception as e:
-                    logging.warning(f"Patch visualization failed for {mosaic_method}_{feature_string}: {e}")
+                    logging.warning(f"Patch visualization failed for {mosaic_selector}_{feature_string}: {e}")
 
             logging.info("Mosaic patch visualizations saved to PDF.")
             del slide_mosaic_paths
         elif validator.is_slide_model(combination_dict.get("feature_extraction")):
             slide_representation_paths = create_slide_feature_paths(config, all_data, features_folder_path)
-            mosaic_method = "slide"
+            mosaic_selector = "slide"
             logging.info(f"Found slide-level features for {len(slide_representation_paths)} slides in {features_folder_path}")
 
         # ---- Generate UMAP plots (if requested) ----
         if "umap" in visualization_cfg:
-            umap_base = os.path.join(vis_base, f"umap_{mosaic_method}_{feature_string}")
+            umap_base = os.path.join(vis_base, f"umap_{mosaic_selector}_{feature_string}")
             umap_cfg = visualization_cfg["umap"]
             run_umap_visualizations(
                 umap_cfg=umap_cfg,
                 slide_representation_paths=slide_representation_paths,
-                mosaic_method=mosaic_method,
+                mosaic_selector=mosaic_selector,
                 output_base=umap_base,
                 annotation_file=config["experiment"]["annotation_file"],
                 random_state=config["experiment"].get("random_state", None)
@@ -618,7 +617,7 @@ def benchmark_sis(config, project):
             search_database = YottixelDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k)
             results = search_database.leave_one_patient_out()
         elif search_method.lower() == 'sish':
-            search_database = SISHDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k, mosaic_string=f"{mosaic_method}_{feature_string}")
+            search_database = SISHDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k, mosaic_string=f"{mosaic_selector}_{feature_string}")
             results = search_database.leave_one_patient_out()
         elif search_method.lower() == 'retccl':
             search_database = RetCCLDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k)
@@ -629,7 +628,7 @@ def benchmark_sis(config, project):
         logging.info(f"Leave-one-patient-out completed with {len(results)} queries.")
 
         # ---- Save retrieval results ----
-        combo_eval_folder = os.path.join(eval_base, f"{search_method}_{mosaic_method}_{feature_string}")
+        combo_eval_folder = os.path.join(eval_base, f"{search_method}_{mosaic_selector}_{feature_string}")
         os.makedirs(combo_eval_folder, exist_ok=True)
 
         save_retrieval_results_to_excel(
@@ -647,7 +646,7 @@ def benchmark_sis(config, project):
                 )
             except Exception as e:
                 logging.warning(
-                    f"Retrieval visualization failed for {search_method}_{mosaic_method}_{feature_string}: {e}"
+                    f"Retrieval visualization failed for {search_method}_{mosaic_selector}_{feature_string}: {e}"
                 )
 
             logging.info("Image retrieval visualizations saved to PDF.")

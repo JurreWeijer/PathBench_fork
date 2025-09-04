@@ -1,20 +1,27 @@
-from tqdm import tqdm
+# ------------------------------------------------------------------------------
+# SPLICE (Streaming Mosaic Selection):
+#   Source Paper:
+#     Alsaafin, A., Nejat, P., Shafique, A., et al. 
+#     “SPLICE -- Streamlining Digital Pathology Image Processing.” arXiv, 2024.
+#     https://doi.org/10.48550/arXiv.2404.17704
+#   No official GitHub available.
+# ------------------------------------------------------------------------------
+
 import logging 
 import numpy as np
-from sklearn.cluster import KMeans
 
-from .base import PatchSelector
-from .registry import register_patch_selectors 
+from .base import MosaicSelector
+from .registry import register_mosaic_selectors 
 
 logger = logging.getLogger(__name__)
 
-@register_patch_selectors
-class SPLICERGB(PatchSelector):
+@register_mosaic_selectors
+class SPLICERGB(MosaicSelector):
     name = "SPLICE_rgb"
     param_key = "percentile_threshold"
 
     """
-    SPLICE RGB Patch Selection
+    SPLICE RGB Mosaic Selection
     --------------------------
     Applies the SPLICE algorithm using RGB color histograms to reduce redundancy
     among selected patches. This method iteratively selects patches and excludes
@@ -104,13 +111,13 @@ class SPLICERGB(PatchSelector):
 
         return selected, group_ids.astype(int), coords, groups
 
-@register_patch_selectors
-class SPLICEFeatures(PatchSelector):
+@register_mosaic_selectors
+class SPLICEFeatures(MosaicSelector):
     name = "SPLICE_features"
     param_key = "percentile_threshold"
 
     """
-    SPLICE Features Patch Selection
+    SPLICE Features Mosaic Selection
     -------------------------------
     Applies the SPLICE algorithm using deep learning features instead of RGB histograms
     to identify and retain a diverse set of informative patches.

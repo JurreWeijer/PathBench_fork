@@ -1,8 +1,8 @@
 from typing import Optional
 
-class PatchSelector:
+class MosaicSelector:
     """
-    Base class for all patch selectors.
+    Base class for all mosaic selectors.
 
     Subclasses must define:
       - name: primary alias (e.g. "SPLICE_rgb")

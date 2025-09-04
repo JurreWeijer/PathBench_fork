@@ -1,17 +1,33 @@
+# ------------------------------------------------------------------------------
+# Yottixel Mosaic Selection:
+#   Based on code from the official Yottixel repository:
+#     https://github.com/KimiaLabMayo/yottixel
+#   Source Paper:
+#     Kalra, S., Tizhoosh, H.R., Choi, C., et al.
+#     “Yottixel – An Image Search Engine for Large Archives of Histopathology Whole Slide Images.”
+#     Medical Image Analysis 65 (2020): 101757. https://doi.org/10.1016/j.media.2020.101757
+#
+# RetCCL-inspired Yottixel variant:
+#   Source Paper:
+#     Wang, X., Du, Y., Yang, S., et al.
+#     “RetCCL: Clustering-Guided Contrastive Learning for Whole-Slide Image Retrieval.”
+#     Medical Image Analysis 83 (2023): 102645. https://doi.org/10.1016/j.media.2022.102645
+# ------------------------------------------------------------------------------
+
 import logging 
 import numpy as np
 from sklearn.cluster import KMeans
 
-from .base import PatchSelector
-from .registry import register_patch_selectors
+from .base import MosaicSelector
+from .registry import register_mosaic_selectors
 
-@register_patch_selectors
-class YottixelRGB(PatchSelector):
+@register_mosaic_selectors
+class YottixelRGB(MosaicSelector):
     name = "Yottixel_rgb"
     param_key = "percentage_selected"
 
     """
-    Yottixel RGB Patch Selection
+    Yottixel RGB Mosaic Selection
     ----------------------------
     Implements the Yottixel mosaic patch selection strategy based on RGB histogram
     clustering and spatial clustering. The algorithm identifies representative patches
@@ -89,13 +105,13 @@ class YottixelRGB(PatchSelector):
 
         return selected, group_ids.astype(int), coords, groups
 
-@register_patch_selectors
-class YottixelFeatures(PatchSelector):
+@register_mosaic_selectors
+class YottixelFeatures(MosaicSelector):
     name = "Yottixel_features"
     param_key = "percentage_selected"
 
     """
-    Yottixel-Features Patch Selection (RetCCL-Inspired)
+    Yottixel-Features Mosaic Selection (RetCCL-Inspired)
     ---------------------------------------------------
     Implements a Yottixel-style two-stage clustering procedure using deep learning
     features instead of RGB histograms. This method balances feature diversity and
