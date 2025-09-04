@@ -14,7 +14,7 @@ from ..image_retrieval.utils import load_patch_dicts_pickle
 def plot_slide_umap(
     annotation_file,
     slide_representation_paths,
-    mosaic_method,
+    mosaic_selector,
     aggregation_method,
     umap_params,
     output_path,
@@ -30,7 +30,7 @@ def plot_slide_umap(
         config:          Experiment config with annotation CSV under
                          config['experiment']['annotation_file'].
         slide_mosaic_paths: Mapping from slide_id to the path of its .pkl.
-        mosaic_method:   Name of the patch-selection method (for titles).
+        mosaic_selector:   Name of the patch-selection method (for titles).
         aggregation_method: "mean", "median", or None.
         umap_params:     Dict of UMAP args (n_neighbors, min_dist, metric, etc).
         output_path:     Where to save the resulting PNG.
@@ -91,7 +91,7 @@ def plot_slide_umap(
         hue=slide_labels, palette="tab10",
         s=80, alpha=0.8
     )
-    plt.title(f"UMAP ({aggregation_method}) — {mosaic_method}")
+    plt.title(f"UMAP ({aggregation_method}) — {mosaic_selector}")
     plt.legend(bbox_to_anchor=(1.05,1), loc='upper left')
     plt.tight_layout()
     plt.savefig(output_path)
@@ -100,7 +100,7 @@ def plot_slide_umap(
 def run_umap_visualizations(
     umap_cfg, 
     slide_representation_paths, 
-    mosaic_method, 
+    mosaic_selector, 
     output_base, 
     annotation_file, 
     random_state=None
@@ -126,7 +126,7 @@ def run_umap_visualizations(
     Args:
         umap_cfg (dict): UMAP settings from the config["visualization"]["umap"] block.
         slide_representation_paths (dict): Mapping slide_id → feature file path (.pkl or .pt).
-        mosaic_method (str): Name of the patch/slide representation method (for plot titles).
+        mosaic_selector (str): Name of the patch/slide representation method (for plot titles).
         output_base (str): Base path for saving plots (suffix is added per aggregation).
         annotation_file (str): Path to CSV with slide annotations; must have "slide" column as index.
         random_state (int, optional): Random seed for UMAP reproducibility.
@@ -162,7 +162,7 @@ def run_umap_visualizations(
             plot_slide_umap(
                 annotation_file=annotation_file,
                 slide_representation_paths=slide_representation_paths,
-                mosaic_method=mosaic_method,
+                mosaic_selector=mosaic_selector,
                 aggregation_method=agg,
                 umap_params=umap_params,
                 output_path=output_path,

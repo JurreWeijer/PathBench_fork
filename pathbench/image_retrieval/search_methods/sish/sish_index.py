@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 import slideflow as sf
 import logging 
 
-from ..image_retrieval.utils import load_patch_dicts_pickle
+from ...utils import load_patch_dicts_pickle
 
 logger = logging.getLogger(__name__)
 

@@ -19,8 +19,9 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from ..image_retrieval.utils import load_patch_dicts_pickle  # same as your Yottixel file
-
+from ...utils import load_patch_dicts_pickle  # same as your Yottixel file
+from ..registry import register_search_methods
+from ..base import SearchMethodBase
 
 def cosine_sim(a, b):
     return float(np.dot(a, b) / (norm(a) * norm(b)))
@@ -38,28 +39,33 @@ class RetCCLSlide:
         self.label = label
         self.features = features  # (n_patches, d) or (1, d)
 
+@register_search_methods
+class RetCCLSearch(SearchMethodBase):
+    name = "retccl"
+    supports = {"patch"}
 
-class RetCCLDatabase:
     """
     RETCCL-based retrieval with YottixelDatabase-compatible I/O.
     No separate organ/tumor branches; single path as requested.
     """
+    
     def __init__(self, config: dict, slide_representation_paths: dict, k: int = 5,
-                 cosine_threshold: float = 0.7):
-        self.k = k
-        self.cosine_threshold = cosine_threshold
+                 cosine_threshold: float = 0.7, **kwargs):
+        # Base sets: self.config, self.paths, self.k, self.mode (validated)
+        super().__init__(config=config, slide_representation_paths=slide_representation_paths, k=k, **kwargs)
 
-        ann_path = config['experiment']['annotation_file']
+        self.cosine_threshold = cosine_threshold
+        self.is_slide = (self.mode == "slide")  # always False with supports={"patch"}, kept for consistency
+
+        # Annotations
+        ann_path = self.config['experiment']['annotation_file']
         self.annotations = pd.read_csv(ann_path).set_index("slide")
 
-        exts = {os.path.splitext(p)[1] for p in slide_representation_paths.values()}
-        if len(exts) > 1:
-            raise ValueError(f"RetCCL: mixed representation types found ({', '.join(exts)}); cannot proceed")
-        self.is_slide = (exts == {'.pt'})
+        # Build in-memory index (patch features per slide)
+        self.slide_index = {}  # slide_id -> RetCCLSlide
+        self._build_patch_features(self.paths)
 
-        self.slide_index = {}      # slide_id -> RetCCLSlide
-        self._build_patch_features(slide_representation_paths)
-
+        # Class weights like your original
         self.class_weight = self._compute_class_weights(factor=10.0)
 
     # ------------------------------

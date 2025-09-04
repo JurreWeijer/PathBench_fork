@@ -16,8 +16,11 @@ import numpy as np
 from bitarray import bitarray
 import bitarray.util as butil
 import torch
-from ..image_retrieval.utils import load_patch_dicts_pickle
 import logging
+
+from ...utils import load_patch_dicts_pickle
+from ..base import SearchMethodBase
+from ..registry import register_search_methods
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +63,8 @@ class BoB:
             total_dist.append(np.min(distances))
         return np.median(total_dist)
 
-class YottixelDatabase:
+@register_search_methods
+class YottixelSearch(SearchMethodBase):
     """
     A simple database of BoBs (slides) supporting image retrieval.
 
@@ -72,25 +76,25 @@ class YottixelDatabase:
         slide_mosaics (dict): Mapping from slide ID to list of patch dictionaries.
         k (int): Number of nearest neighbors to use in retrieval.
     """
-    def __init__(self, config: dict, slide_representation_paths: dict, k: int = 3):
-        self.k = k
-        self.bobs = []
+    name = "yottixel"
+    supports = {"patch", "slide"}
 
-        # Load slide annotations
-        annotation_path = config['experiment']['annotation_file']
+    def __init__(self, config: dict, slide_representation_paths: dict, k: int = 3, **kwargs):
+        # base sets: self.config, self.paths, self.k, self.mode ("patch" or "slide")
+        super().__init__(config=config, slide_representation_paths=slide_representation_paths, k=k, **kwargs)
+
+        self.bobs = []
+        self.is_slide = (self.mode == "slide")  # keep the boolean if other code expects it
+
+        # Load annotations once
+        annotation_path = self.config['experiment']['annotation_file']
         self.annotations = pd.read_csv(annotation_path).set_index("slide")
 
-        exts = {os.path.splitext(p)[1] for p in slide_representation_paths.values()}
-        if len(exts) > 1:
-            raise ValueError(
-                f"Yottixel: mixed representation types found ({', '.join(exts)}); cannot proceed"
-            )
-        self.is_slide = (exts == {'.pt'})
-
+        # Build BoBs depending on mode
         if self.is_slide:
-            self.build_slide_bobs(slide_representation_paths)
-        else: 
-            self.build_patch_bobs(slide_representation_paths)
+            self.build_slide_bobs(self.paths)
+        else:
+            self.build_patch_bobs(self.paths)
 
     def build_patch_bobs(self, slide_representation_paths: dict):
         # Create a BoB for each slide using binarized features

@@ -34,6 +34,7 @@ import os
 import glob
 import logging
 from itertools import product
+from matplotlib.style import available
 import numpy as np
 from tqdm import tqdm
 import pandas as pd
@@ -67,9 +68,6 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 from ..benchmarking.benchmark import calculate_combinations, generate_bags
 from ..utils.utils import free_up_gpu_memory
-from ..image_retrieval.yottixel_search import YottixelDatabase
-from ..image_retrieval.retccl_search import RetCCLDatabase
-from ..image_retrieval.sish_search import SISHDatabase
 from ..image_retrieval.config_validator import SISConfigValidator
 from ..image_retrieval.utils import load_patch_dicts_from_tfr, load_patch_dicts_pickle, save_patch_dicts_pickle, save_retrieval_metrics, save_retrieval_results_to_excel, log_mem, cleanup_dev_shm
 from ..image_retrieval.vis_patch_selection import generate_patch_selection_report_pdf
@@ -77,8 +75,8 @@ from ..image_retrieval.evaluation import evaluate_retrieval_metrics, parse_metri
 from ..image_retrieval.vis_retrieval_results import generate_image_retrieval_report_pdf
 from ..image_retrieval.vis_umap import run_umap_visualizations
 from ..image_retrieval.mosaic_selectors import splice, yottixel, sdm  
-
 from ..image_retrieval.mosaic_selectors.registry import build_mosaic_selector, get_selector_param_key
+from ..image_retrieval.search_methods.registry import build_search_method, list_search_methods
 
 import slideflow as sf
 from slideflow.model import build_feature_extractor
@@ -606,25 +604,27 @@ def benchmark_sis(config, project):
             )
 
         # ---- Similar Image Search Benchmark ----
+        available = list_search_methods()
+        logging.info("Registered search methods: %s", ", ".join(available) or "(none)")
+        
         search_string = combination_dict.get('search_method', 'yottixel-10')
-        search_parts = search_string.split('-')
+        search_parts = search_string.split('-', 1)
         search_method = search_parts[0]
-        k = int(search_parts[1]) if len(search_parts) > 1 else 5
+        k = int(search_parts[1]) if len(search_parts) > 1 and search_parts[1].isdigit() else 5
 
         logging.info(f"Running leave-one-patient-out evaluation using {search_method} retrieving {k} slides...")
-        # Run search method
-        if search_method.lower() == 'yottixel':
-            search_database = YottixelDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k)
-            results = search_database.leave_one_patient_out()
-        elif search_method.lower() == 'sish':
-            search_database = SISHDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k, mosaic_string=f"{mosaic_selector}_{feature_string}")
-            results = search_database.leave_one_patient_out()
-        elif search_method.lower() == 'retccl':
-            search_database = RetCCLDatabase(config=config, slide_representation_paths=slide_representation_paths, k=k)
-            results = search_database.leave_one_patient_out()
-        else:
-            raise ValueError(f"Search method '{search_method}' is not implemented. Please choose a supported method.")
-        
+
+        searcher = build_search_method(
+            name=search_method,
+            config=config,
+            slide_representation_paths=slide_representation_paths,
+            k=k,
+            # harmless for methods that don't use it; constructors accept **kwargs
+            mosaic_string=f"{mosaic_selector}_{feature_string}",
+        )
+
+        results = searcher.leave_one_patient_out()
+
         logging.info(f"Leave-one-patient-out completed with {len(results)} queries.")
 
         # ---- Save retrieval results ----

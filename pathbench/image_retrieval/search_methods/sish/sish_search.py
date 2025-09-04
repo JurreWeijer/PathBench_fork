@@ -1,34 +1,29 @@
 import os
-import time
-import numpy as np
-import h5py
-import torch
-import openslide
-import copy
-import pickle
-import pandas as pd
-from collections import OrderedDict
-from torchvision.models import densenet121
-from torchvision import transforms
-from tqdm import tqdm
-from typing import Dict, Optional
-import slideflow as sf
-import multiprocessing
-import logging
-import multiprocessing as mp
-from collections import Counter
-from torchvision import transforms
-import psutil, os, sys, gc
 import json
-from collections import defaultdict
-import torch.multiprocessing as mp
-mp.set_sharing_strategy('file_system')
+import gc
+import logging
+import pickle
+from collections import OrderedDict, defaultdict, Counter
+from typing import Dict
 
-from ..image_retrieval.sish_index import min_max_binarized, compute_latent_features, slide_to_index
-from ..image_retrieval.sish_eval import Uncertainty_Cal, Clean, Filtered_BY_Prediction
-from ..image_retrieval.sish_vqvae import LargeVectorQuantizedVAE_Encode
-from ..image_retrieval.sish_veb import VEB
-from ..image_retrieval.utils import load_patch_dicts_pickle
+import numpy as np
+import pandas as pd
+import torch
+import psutil
+from tqdm import tqdm
+from torchvision import transforms
+
+import torch.multiprocessing as tmp
+tmp.set_sharing_strategy("file_system")
+
+from ..sish.sish_index import compute_latent_features, slide_to_index
+from ..sish.sish_eval import Uncertainty_Cal, Clean, Filtered_BY_Prediction
+from ..sish.sish_vqvae import LargeVectorQuantizedVAE_Encode
+from ..sish.sish_veb import VEB
+from ...utils import load_patch_dicts_pickle
+
+from ..registry import register_search_methods
+from ..base import SearchMethodBase
 
 logger = logging.getLogger(__name__)
 
@@ -60,18 +55,23 @@ def log_mem(tag):
                  f"CUDA alloc/res={alloc:.0f}/{reserv:.0f} MB  /dev/shm={shm:.2f} GB")
 
 
-class SISHDatabase:
+@register_search_methods
+class SISHSearch(SearchMethodBase):
     """
     SISHDatabase implements the Selection of Informative Samples in Histopathology (SISH) retrieval pipeline.
     It builds and manages an index over slide-level patch mosaics using a VQ-VAE encoder,
     hierarchical pooling, and a Van Emde Boas (VEB) tree for efficient nearest-neighbor search.
     """
+    name = "sish"
+    supports = {"patch"}
+
     def __init__(
         self,
         config: dict,
         slide_representation_paths: Dict[str, str],
         k: int,
-        mosaic_string: str
+        mosaic_string: str,
+        **kwargs
     ) -> None:
         """
         Initialize the SISHDatabase.
@@ -95,62 +95,44 @@ class SISHDatabase:
             pool_layers (List[nn.Module]): Pooling layers for hierarchical sums.
             pool (Pool): Multiprocessing pool for semantic mapping.
         """
-        # ---- store parameters ----
-        self.config = config
-        self.slide_representations_paths = slide_representation_paths
-        self.topk = k
+        super().__init__(config=config, slide_representation_paths=slide_representation_paths, k=k, **kwargs)
+                # Keep your existing names so downstream code stays unchanged
+        self.slide_representations_paths = self.paths
+        self.topk = self.k
         self.mosaic_string = mosaic_string
 
-        # Ensure we get patch-level information
-        exts = {os.path.splitext(p)[1] for p in slide_representation_paths.values()}
-        if len(exts) > 1:
-            raise ValueError(f"SISH: mixed representation types found ({exts}); cannot proceed")
-        if exts != {'.pkl'}:
-            raise ValueError(f"SISH: expected patch-level representations (.pkl), got {exts}")
-
-        # ---- initialize in-memory structures ----
-        self.meta = {}   # key:int -> List[meta-dict]
-        self.keys = []   # flat list of all keys for VEB
-        self.vebtree = None
-        self.is_patch = False
+        # Derive the old is_patch flag from the validated mode
+        self.is_slide = (self.mode == "slide") 
+        self.return_patch_matches = False
 
         # ---- create directories for index storage ----
-        project_dir = os.path.join("experiments", config['experiment']['project_name'])
-
+        project_dir = os.path.join("experiments", self.config['experiment']['project_name'])
         sish_dir = os.path.join(project_dir, "sish")
         os.makedirs(sish_dir, exist_ok=True)
-
         self.index_veb_path = os.path.join(sish_dir, f"veb_{mosaic_string}.pkl")
         self.meta_database_path = os.path.join(sish_dir, f"meta_{mosaic_string}.pkl")
 
         # ---- load slide-level annotations ----
-        annotations_path = config['experiment']['annotation_file']
+        annotations_path = self.config['experiment']['annotation_file']
         self.annotations = pd.read_csv(annotations_path).set_index('slide')
         logging.info(f"Loaded annotations for {len(self.annotations)} slides from {annotations_path}")
 
         # ---- initialize VQ-VAE encoder and codebook ----
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        codebook_path = config["SISH_metrics"]["codebook_semantic"]
-        checkpoint_path = config["SISH_metrics"]["vqvae_checkpoint"]
+        codebook_path = self.config["SISH_metrics"]["codebook_semantic"]
+        checkpoint_path = self.config["SISH_metrics"]["vqvae_checkpoint"]
         self.codebook_semantic = torch.load(codebook_path)
         logging.debug(f"Loaded semantic codebook from {codebook_path}")
 
-        # ---- instantiate and load encode-only VQ-VAE ----
-        self.vqvae = LargeVectorQuantizedVAE_Encode(
-            code_dim=256,
-            code_size=128
-        )
-        # transform: image tensor [0,1] -> [-1,1]
+        self.vqvae = LargeVectorQuantizedVAE_Encode(code_dim=256, code_size=128)
         self.transform_vqvqe = transforms.Lambda(scale_to_minus1_to_1)
 
-        # ---- load encoder & codebook weights, stripping 'module.' prefix ----
         raw_checkpoint = torch.load(checkpoint_path)['model']
         enc_weights = OrderedDict({
             k[len("module."):]: v
             for k, v in raw_checkpoint.items()
             if k.startswith("module.encoder.") or k.startswith("module.codebook.")
         })
-
         self.vqvae.load_state_dict(enc_weights)
         self.vqvae.to(self.device).eval()
         logging.info("VQ-VAE encoder weights loaded; model set to eval mode.")
@@ -162,10 +144,10 @@ class SISHDatabase:
             torch.nn.AvgPool2d((2, 2))
         ]
 
-        # ---- create multiprocessing pool ----
-        #num_workers = mp.cpu_count()
-        #self.pool = mp.Pool(num_workers)
-        #logging.debug(f"Initialized multiprocessing pool with {num_workers} workers")
+        # ---- in-memory structures ----
+        self.meta = {}   # key:int -> List[meta-dict]
+        self.keys = []   # flat list of all keys for VEB
+        self.vebtree = None
         self.pool = None
 
     def build_index(self) -> None:
@@ -456,7 +438,7 @@ class SISHDatabase:
             None: Updates self.meta_clean in-place.
         """
         # ---- choose metadata source based on mode ----
-        if self.is_patch:
+        if self.return_patch_matches:
             # In patch-level mode, do not filter anything
             self.meta_clean = self.meta
             logging.debug(f"No patient filtering applied (patch-level mode); kept all {len(self.meta)} keys")
@@ -550,7 +532,7 @@ class SISHDatabase:
                     logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {thrsh}")
                     entry = candidates_clean[min_idx]
                     visited[pre] = True
-                    if not self.is_patch:
+                    if not self.return_patch_matches:
                         logging.info(f"Slide mode: {entry['slide_name']}")
                         res.append((
                             query_index,
@@ -606,7 +588,7 @@ class SISHDatabase:
                     logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {thrsh}")
                     entry = candidates_clean[min_idx]
                     visited[succ] = True
-                    if not self.is_patch:
+                    if not self.return_patch_matches:
                         logging.info(f"Accepted candidate: {entry}")
                         res.append((
                             query_index,
@@ -685,7 +667,7 @@ class SISHDatabase:
         res_srt = sorted(res_tmp, key=lambda x: x[3])
 
         # ---- choose field names based on mode ----
-        if self.is_patch:
+        if self.return_patch_matches:
             field_names = ['query', 'index', 'global_dist', 'hamming_dist', 'patch_name', 'category']
         else:
             field_names = ['query', 'index', 'global_dist', 'hamming_dist',
