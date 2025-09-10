@@ -1,12 +1,21 @@
 import os
 import re
 import logging
+import importlib
+import pkgutil
 
 from difflib import get_close_matches
 
-from .mosaic_selectors.registry import list_mosaic_selectors, get_selector_param_key
-from .search_methods.registry import list_search_methods, get_search_method_supports
-from slideflow_fork.slideflow.model.extractors._registry import list_extractors as sf_list_extractors, is_extractor as sf_is_extractor
+from .mosaic_selectors.registry import list_mosaic_selectors, get_mosaic_selector_hyperparams, has_mosaic_selector
+from .search_methods.registry import list_search_methods, get_search_method_supports, get_search_method_hyperparams
+from slideflow.model.extractors._registry import list_extractors as sf_list_extractors, is_extractor as sf_is_extractor
+
+import importlib, logging
+try:
+    importlib.import_module("pathbench.models.feature_extractors")
+    logging.debug("Imported pathbench.models.feature_extractors")
+except Exception as e:
+    logging.warning(f"Could not import PathBench extractors: {e}")
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +23,7 @@ class SISConfigValidator:
     # allowed values—everything stored in lower case
     ALLOWED_QC = {"gaussianv2", "otsu-clahe"}
     ALLOWED_DATASET_USE = {"training", "validation", "testing"}
-    ALLOWED_VIZ_METHODS = {"umap-mean", "umap-median", "umap-none", "patch_selection-extensive", "patch_selection-simple"}
+    ALLOWED_VIZ_METHODS = {"umap", "patch_selection", "retrieval_report"}
     ALLOWED_UMAP_KEYS = {"n_neighbors", "min_dist", "metric"}
     ALLOWED_NORMALIZATIONS = {"reinhard", "macenko", "cyclegan"}
 
@@ -34,6 +43,57 @@ class SISConfigValidator:
         self._validate_other()
         if self.errors:
             raise ValueError("Configuration validation failed:\n" + "\n".join(self.errors))
+    
+    def _parse_name_params_list(self, items, available_names, section_name):
+        """
+        Normalize a list where each item is either:
+        - "name"                         -> (name, {})
+        - "name-<k>"  (legacy search)    -> (name, {"k": int(k)})
+        - {name: {param: value, ...}}    -> (name, params)
+        - {name: null}                   -> (name, {})
+        Names are lower-cased. Validates that name is in available_names.
+        """
+        out = []
+        if not isinstance(items, list):
+            self.errors.append(f"`benchmark_parameters.{section_name}` must be a list")
+            return out
+
+        for i, item in enumerate(items):
+            name, params = None, {}
+            if isinstance(item, str):
+                s = item.strip().lower()
+                if section_name == "search_method" and "-" in s and s.rsplit("-", 1)[1].isdigit():
+                    base, kstr = s.rsplit("-", 1)
+                    name, params = base, {"k": int(kstr)}
+                else:
+                    name = s
+            elif isinstance(item, dict):
+                if len(item) != 1:
+                    self.errors.append(
+                        f"[benchmark_parameters.{section_name}][{i}] must be a single-key mapping; got {item!r}"
+                    ); continue
+                (raw_name, raw_params), = item.items()
+                name = str(raw_name).lower()
+                if raw_params is None:
+                    params = {}
+                elif isinstance(raw_params, dict):
+                    params = raw_params
+                else:
+                    self.errors.append(
+                        f"[benchmark_parameters.{section_name}][{i}] params must be a mapping or null; got {type(raw_params).__name__}"
+                    ); continue
+            else:
+                self.errors.append(
+                    f"[benchmark_parameters.{section_name}][{i}] must be a string or single-key mapping; got {type(item).__name__}"
+                ); continue
+
+            if name not in available_names:
+                self.errors.append(
+                    f"Unknown {section_name.rstrip('s')} '{name}'. Available: {sorted(available_names)}"
+                ); continue
+
+            out.append((name, params))
+        return out
 
     def _validate_experiment(self):
         exp = self.cfg.get("experiment", {})
@@ -125,13 +185,92 @@ class SISConfigValidator:
                 )
 
     def _validate_visualization(self):
-        viz = self.cfg["experiment"].get("visualization", [])
-        if not isinstance(viz, list):
-            self.errors.append("`visualization` must be a list")
+        viz = self.cfg["experiment"].get("visualization", {})
+        if not isinstance(viz, dict):
+            self.errors.append("`experiment.visualization` must be a mapping (dict).")
             return
-        for v in viz:
-            if v.lower() not in self.ALLOWED_VIZ_METHODS:
-                self.errors.append(f"Unknown visualization method: {v}")
+
+        allowed_sections = {"patch_selection", "umap", "retrieval_report"}
+        for section in viz.keys():
+            if section not in allowed_sections:
+                self.errors.append(
+                    f"Unknown visualization section `{section}`. "
+                    f"Allowed: {sorted(allowed_sections)}"
+                )
+
+        # ---- patch_selection ----
+        if "patch_selection" in viz:
+            ps = viz["patch_selection"]
+            if not isinstance(ps, dict):
+                self.errors.append("`experiment.visualization.patch_selection` must be a dict.")
+            else:
+                mode = ps.get("mode")
+                valid_modes = {"extensive", "simple"}
+                if mode is None:
+                    self.errors.append(
+                        "`experiment.visualization.patch_selection.mode` is required "
+                        "and must be 'extensive' or 'simple'."
+                    )
+                elif str(mode).lower() not in valid_modes:
+                    self.errors.append(
+                        f"Invalid `patch_selection.mode`: {mode!r}. "
+                        f"Allowed: {sorted(valid_modes)}"
+                    )
+                if "max_per_file" in ps:
+                    mpf = ps["max_per_file"]
+                    if not isinstance(mpf, int) or mpf <= 0:
+                        self.errors.append(
+                            "`experiment.visualization.patch_selection.max_per_file` "
+                            "must be a positive integer."
+                        )
+
+        # ---- umap ----
+        if "umap" in viz:
+            um = viz["umap"]
+            if not isinstance(um, dict):
+                self.errors.append("`experiment.visualization.umap` must be a dict.")
+            else:
+                agg = um.get("agg_methods")
+                valid_aggs = {"mean", "median", "none"}
+                if agg is None:
+                    self.errors.append(
+                        "`experiment.visualization.umap.agg_methods` is required "
+                        "and must be a list of 'mean', 'median', or 'none'."
+                    )
+                elif not isinstance(agg, (list, tuple, set)):
+                    self.errors.append(
+                        "`experiment.visualization.umap.agg_methods` must be a list/tuple/set of strings."
+                    )
+                else:
+                    for i, a in enumerate(agg):
+                        if not isinstance(a, str) or a.lower() not in valid_aggs:
+                            self.errors.append(
+                                f"Invalid `umap.agg_methods[{i}]` = {a!r}. "
+                                f"Allowed: {sorted(valid_aggs)}"
+                            )
+                # parameters are optional; allow dict or list (your YAML uses a list of single-key dicts)
+                params = um.get("parameters")
+                if params is not None and not isinstance(params, (list, dict)):
+                    self.errors.append(
+                        "`experiment.visualization.umap.parameters` must be a dict or list."
+                    )
+
+        # ---- retrieval_report (optional) ----
+        if "retrieval_report" in viz:
+            rr = viz["retrieval_report"]
+            if not isinstance(rr, dict):
+                self.errors.append("`experiment.visualization.retrieval_report` must be a dict.")
+            else:
+                if "include_metadata" in rr and not isinstance(rr["include_metadata"], bool):
+                    self.errors.append(
+                        "`experiment.visualization.retrieval_report.include_metadata` must be a boolean."
+                    )
+                if "max_per_file" in rr:
+                    mpf = rr["max_per_file"]
+                    if not isinstance(mpf, int) or mpf <= 0:
+                        self.errors.append(
+                            "`experiment.visualization.retrieval_report.max_per_file` must be a positive integer."
+                        )
 
     def _validate_umap_parameters(self):
         params = self.cfg.get("umap_parameters", [])
@@ -195,62 +334,37 @@ class SISConfigValidator:
                     f"Available: {sorted(available_extractors)}"
                 )
 
-        # search_method
+        # ---- search_method: only check that provided param names exist in schema ----
         available_methods = set(list_search_methods())
-        for search_method in bp.get("search_method", []):
-            parts = search_method.split("-", 1)
-            base = parts[0].lower()
-            kstr = parts[1] if len(parts) == 2 else None
-
-            if base not in available_methods:
+        parsed_search = self._parse_name_params_list(
+            bp.get("search_method", []), available_methods, "search_method"
+        )
+        for i, (method, params) in enumerate(parsed_search):
+            # fetch schema declared by the method
+            schema = get_search_method_hyperparams(method) or {}
+            allowed_keys = set(schema.keys())
+            # allow empty params; only flag unknown keys
+            unknown = set(params.keys()) - allowed_keys
+            if unknown:
                 self.errors.append(
-                    f"Unknown search_method '{base}'. Available: {sorted(available_methods)}"
+                    f"[benchmark_parameters.search_method][{i}] '{method}' got unknown param(s): "
+                    f"{sorted(unknown)}. Allowed: {sorted(allowed_keys)}"
                 )
-                continue
 
-            # keep your existing requirement that k is provided and numeric
-            if kstr is None or not kstr.isdigit():
-                self.errors.append(f"Invalid search_method entry (need '-<k>'): {search_method}")
-
-        # mosaic_method
-        available = set(list_mosaic_selectors())  # e.g. {'splice_rgb','splice_features','yottixel_rgb','yottixel_features','sdm_features'}
-        for mosaic_selector in bp.get("mosaic_selector", []):
-            parts = mosaic_selector.split("-", 1)
-            base = parts[0].lower()
-            suffix = parts[1] if len(parts) == 2 else None
-
-            if base not in available:
+        # ---- mosaic_selector: only check that provided param names exist in schema ----
+        available_selectors = set(list_mosaic_selectors())
+        parsed_selectors = self._parse_name_params_list(
+            bp.get("mosaic_selector", []), available_selectors, "mosaic_selector"
+        )
+        for i, (selector, params) in enumerate(parsed_selectors):
+            schema = get_mosaic_selector_hyperparams(selector) or {}
+            allowed_keys = set(schema.keys())
+            unknown = set(params.keys()) - allowed_keys
+            if unknown:
                 self.errors.append(
-                    f"Unsupported mosaic_method '{mosaic_selector}'. "
-                    f"Available: {sorted(available)}"
+                    f"[benchmark_parameters.mosaic_selector][{i}] '{selector}' got unknown param(s): "
+                    f"{sorted(unknown)}. Allowed: {sorted(allowed_keys)}"
                 )
-                continue
-
-            param_key = get_selector_param_key(base)  # None for selectors without a numeric arg
-
-            if param_key is None:
-                # selector does not take a numeric parameter
-                if suffix and suffix.lower() != "none":
-                    logging.warning(
-                        f"Selector '{base}' takes no parameter; use '{base}' or '{base}-none', got '{mosaic_selector}'. (skipping strict validation)"
-                    )
-            else:
-                # selector expects a numeric parameter (e.g., percentage/percentile)
-                if suffix is None:
-                    self.errors.append(
-                        f"Selector '{base}' expects a '{param_key}' value (e.g., '{base}-30')."
-                    )
-                elif suffix.lower() == "none":
-                    self.errors.append(
-                        f"Selector '{base}' requires numeric '{param_key}', not 'none' (got '{mosaic_selector}')."
-                    )
-                else:
-                    try:
-                        float(suffix)
-                    except ValueError:
-                        self.errors.append(
-                            f"Invalid value for '{param_key}' in '{mosaic_selector}'; expected a number."
-                        )
         
     def _validate_other(self):
         wd = self.cfg.get("weights_dir","")
@@ -287,8 +401,8 @@ class SISConfigValidator:
           - slide‐models only go with slide‐searches
         """
         feat = combo.get("feature_extraction", "").lower()
-        search = combo.get("search_method", "").lower().split("-")[0]
-
+        search = combo.get("search_method", "").lower()
+        
         # patch‐level extractor must use a patch‐level search
         if self.is_patch_extractor(feat) and not self.is_patch_search(search):
             self._combination_error = (

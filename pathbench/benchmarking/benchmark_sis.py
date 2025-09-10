@@ -66,16 +66,23 @@ import torch.multiprocessing as tmp
 tmp.set_start_method("spawn", force=True)
 torch.multiprocessing.set_sharing_strategy("file_system")
 
-from ..benchmarking.benchmark import calculate_combinations, generate_bags
+from ..benchmarking.benchmark import generate_bags
 from ..utils.utils import free_up_gpu_memory
 from ..image_retrieval.config_validator import SISConfigValidator
-from ..image_retrieval.utils import load_patch_dicts_from_tfr, load_patch_dicts_pickle, save_patch_dicts_pickle, save_retrieval_metrics, save_retrieval_results_to_excel, log_mem, cleanup_dev_shm
+from ..image_retrieval.utils import (load_patch_dicts_from_tfr, 
+                                     load_patch_dicts_pickle, 
+                                     save_patch_dicts_pickle, 
+                                     save_retrieval_metrics, 
+                                     save_retrieval_results_to_excel, 
+                                     calculate_combinations,
+                                     build_param_id_string,
+                                     )
 from ..image_retrieval.visualization.mosaic_selection import generate_mosaic_selection_report_pdf
 from ..image_retrieval.evaluation import evaluate_retrieval_metrics, parse_metric_names
 from ..image_retrieval.visualization.retrieval_results import generate_image_retrieval_report_pdf
 from ..image_retrieval.visualization.umap import run_umap_visualizations
-from ..image_retrieval.mosaic_selectors import splice, yottixel, sdm  
-from ..image_retrieval.mosaic_selectors.registry import build_mosaic_selector, get_selector_param_key
+from ..image_retrieval.mosaic_selectors import splice, yottixel, sdm, hshr 
+from ..image_retrieval.mosaic_selectors.registry import build_mosaic_selector
 from ..image_retrieval.search_methods.registry import build_search_method, list_search_methods
 
 import slideflow as sf
@@ -205,7 +212,7 @@ def make_patch_mosaic(args):
     """
     (slide_id, tfr_path, feats_pt, feats_idx,
      patches_pkl_folder, mosaic_folder,
-     patch_size, selector, percentile, config) = args  
+     patch_size, selector_name, selector_params, config) = args  
 
     # ---- Paths to the **patch** dictionary dump ----
     patches_pkl = os.path.join(patches_pkl_folder, f"{slide_id}.pkl")
@@ -227,17 +234,10 @@ def make_patch_mosaic(args):
 
     if not (os.path.exists(mosaic_pkl) and os.path.getsize(mosaic_pkl) > 0):
         # Build selector in the worker (don’t pickle instances across processes)
-        patch_selector = build_mosaic_selector(selector, config)
-        selector_kwargs = {}
-        param_key = get_selector_param_key(selector)
-        if param_key is not None and percentile is not None:
-            selector_kwargs[param_key] = percentile
+        patch_selector = build_mosaic_selector(selector_name, selector_params, config)
 
         # Run selection (kwargs may be empty for methods without a param)
-        selected, group_ids, coords, groups = patch_selector.run(
-            patch_data["patches"],
-            **(selector_kwargs or {})
-        )
+        selected, group_ids, coords, groups = patch_selector.run(patch_data["patches"], **{})
 
         subset = [patch_data["patches"][i] for i in selected]
 
@@ -274,12 +274,13 @@ def make_slide_mosaic(
 
     (slide_id, tfr_path, feats_pt, feats_idx,
      patches_pkl_folder, mosaic_folder,
-     patch_size, selector, percentile, config) = args
+     patch_size, selector_name, selector_params, config) = args
     
     # 1) Load the feature tensor
     feats = torch.load(feats_pt)
     arr   = feats.numpy() if hasattr(feats, "numpy") else feats
     arr   = np.asarray(arr)
+
     # if it’s 1-D, make it shape (1, F)
     if arr.ndim == 1:
         arr = arr[np.newaxis, :]
@@ -317,8 +318,8 @@ def make_slide_mosaic(
 def create_slide_mosaic_mp(
     config,
     all_data,
-    selector,
-    percentile,
+    selector_name,
+    selector_params,
     mosaics_base,
     features_folder_path,
     patch_size
@@ -330,7 +331,7 @@ def create_slide_mosaic_mp(
     Returns:
         dict[slide_id → path_to_mosaic_pkl]
     """
-    logging.info(f"Running mosaic creation using method={selector}")
+    logging.info(f"Running mosaic creation using method={selector_name}")
 
     # 1) Prepare all the base‐paths/folders
     slide_mosaic_paths = {}
@@ -339,14 +340,13 @@ def create_slide_mosaic_mp(
     patches_pkl_folder = os.path.join(mosaics_base, f"patches_{os.path.basename(os.path.normpath(features_folder_path))}") #TODO: see if we can store the patches only once
     os.makedirs(patches_pkl_folder, exist_ok=True)
 
-    pct_str = "all" if percentile is None else str(percentile) #TODO: all should not be added when there is no percentage
-    features_suffix = (
-        f"_{os.path.basename(os.path.normpath(features_folder_path))}"
-        if "features" in selector.lower() else ""
-    )
+    features_suffix = f"_{os.path.basename(os.path.normpath(features_folder_path))}"
+
+    param_id = build_param_id_string("selector", selector_name, selector_params, compact=True)
+    params_suffix = f"_{param_id}" if param_id else ""
     mosaic_folder = os.path.join(
         mosaics_base,
-        f"{selector}_{pct_str}{features_suffix}"
+        f"{selector_name}{params_suffix}{features_suffix}"
     )
     os.makedirs(mosaic_folder, exist_ok=True)
 
@@ -380,8 +380,8 @@ def create_slide_mosaic_mp(
                     patches_pkl_folder,
                     mosaic_folder,
                     patch_size,
-                    selector,
-                    percentile,
+                    selector_name,
+                    selector_params,
                     config
                 )
             )
@@ -457,6 +457,84 @@ def check_precomputed_features(all_data, features_folder_path):
                       f"{' ...' if len(missing) > 10 else ''}")
         raise FileNotFoundError("Precomputed features are missing. Cannot continue without GPU.")
 
+def summarize_combination_strings(
+    config: dict,
+    combination_dict: dict,
+) -> dict:
+    """
+    Return all canonical strings for a given combination.
+
+    Output keys:
+      - tile_string:      e.g. "256px_128um"
+      - feature_string:   e.g. "256px_128um_reinhard_uni"
+      - selector_name:    e.g. "splice_rgb" or "slide"
+      - selector_param_id:e.g. "25" (compact, from include_in_id params only)
+      - selector_full:    e.g. "splice_rgb_25" or "slide"
+      - search_method:    e.g. "yottixel"
+      - search_param_id:  e.g. "10" (compact, from include_in_id params only)
+      - search_full:      e.g. "yottixel_10"
+      - mosaic_string:    e.g. "splice_rgb_256px_128um_reinhard_uni"
+      - combo_id:         e.g. "yottixel_10__splice_rgb_25__256px_128um_reinhard_uni"
+                           (selector segment omitted for slide-level extractors)
+    Notes:
+      - Uses registry metadata via build_param_id_string("selector"| "search", name, params, compact=True).
+      - Injects `mosaic_string` into search params (needed by e.g. SISH); it only appears in IDs
+        if that param is marked `include_in_id=True` in the method HYPERPARAMS.
+      - No heavy class instantiation.
+    """
+    # ---- basic feature strings ----
+    tile_px = combination_dict["tile_px"]
+    tile_um_raw = combination_dict["tile_um"]
+    tile_um = str(tile_um_raw) if str(tile_um_raw).endswith("x") else f"{tile_um_raw}um"
+
+    normalization = combination_dict["normalization"]
+    extractor = combination_dict["feature_extraction"].lower()
+
+    tile_string = f"{tile_px}px_{tile_um}"
+    feature_string = f"{tile_string}_{normalization}_{extractor}"
+
+    # ---- selector (only for patch-level extractors) ----
+    validator = SISConfigValidator(config)
+    is_patch = validator.is_patch_extractor(extractor)
+
+    if is_patch:
+        selector_name = combination_dict["mosaic_selector"].lower()
+        selector_params = dict(combination_dict.get("mosaic_selector_params", {}) or {})
+        selector_param_id = build_param_id_string("selector", selector_name, selector_params, compact=True)
+        selector_full = f"{selector_name}_{selector_param_id}" if selector_param_id else selector_name
+        mosaic_string = f"{selector_full}_{feature_string}"
+    else:
+        selector_name = "slide"
+        selector_params = {}
+        selector_param_id = ""
+        selector_full = "slide"
+        mosaic_string = f"slide_{feature_string}"
+
+    # ---- search method (registry-driven, no instantiation) ----
+    search_method = combination_dict["search_method"].lower()
+    search_params = dict(combination_dict.get("search_method_params", {}) or {})
+    search_param_id = build_param_id_string("search", search_method, search_params, compact=True)
+    search_full = f"{search_method}_{search_param_id}" if search_param_id else search_method
+
+    # ---- final combo id ----
+    if is_patch:
+        combo_id = f"{search_full}__{selector_full}__{feature_string}"
+    else:
+        combo_id = f"{search_full}__{feature_string}"
+
+    return {
+        "tile_string": tile_string,
+        "feature_string": feature_string,
+        "selector_name": selector_name,
+        "selector_param_id": selector_param_id,
+        "selector_full": selector_full,
+        "search_method": search_method,
+        "search_param_id": search_param_id,
+        "search_full": search_full,
+        "mosaic_string": mosaic_string,
+        "combo_id": combo_id,
+    }
+
 def benchmark_sis(config, project):
     """
     Benchmarking for image retrieval experiments.
@@ -473,7 +551,7 @@ def benchmark_sis(config, project):
     # ---- Validate the user’s config before doing any work ----
     validator = SISConfigValidator(config)
     validator.validate()
-    logging.info("Configuration validated successfully, continuing with benchmarking.")
+    #logging.info("Configuration validated successfully, continuing with benchmarking.")
 
     # ---- Define paths ----
     project_dir = os.path.join("experiments", config['experiment']['project_name'])
@@ -489,7 +567,6 @@ def benchmark_sis(config, project):
     # ---- Calculate parameter combinations ----
     all_combinations = calculate_combinations(config)
     logging.info(f"Total number of combinations: {len(all_combinations)}")
-    benchmark_parameters = config['benchmark_parameters']
 
     resume_flag = bool(config['experiment'].get('resume', False))
     checkpoint_path = os.path.join(project_dir, 'completed_combinations.json')
@@ -504,30 +581,26 @@ def benchmark_sis(config, project):
             logging.warning("Resume=True but no checkpoint file found — starting from scratch.")
     
     # ---- Get visualization config ----
-    visualization_cfg = config.get("visualization", {})
+    visualization_cfg = config["experiment"].get("visualization", {})
 
     # ---- Iterate over each configuration ----
-    for combination in all_combinations:
-        combination_dict = {param: value for param, value in zip(benchmark_parameters.keys(), combination)}
+    for combination_dict in all_combinations:
         logging.info(f"Processing combination: {combination_dict}")
 
-        # Strings used for filenames and identifiers
-        tile_string = f"{combination_dict['tile_px']}px_{str(combination_dict['tile_um']) if str(combination_dict['tile_um']).endswith('x') else str(combination_dict['tile_um']) + 'x'}"
-        feature_string = "_".join([f"{value}" for key, value in combination_dict.items() if key not in ['mil', 'loss', 'augmentation', 'activation_function', 'optimizer', 'mosaic_selector', 'search_method', 'roi']])
-        combo_id = "_".join([f"{value}" for key, value in combination_dict.items()])
-
         if not validator.is_valid_combination(combination_dict):
-            logging.warning(f"Skipping combo {combo_id!r}: {validator.combination_error}")
+            logging.warning(f"Skipping combo {combination_dict}: {validator.combination_error}")
             continue 
 
-        if combo_id in completed:
-            logging.info(f"Skipping already completed combo: {combo_id}")
+        id_strings = summarize_combination_strings(config, combination_dict)
+        if id_strings["combo_id"] in completed:
+            logging.info(f"Skipping already completed combo: {id_strings['combo_id']}")
             continue
 
         # ---- Tile extraction ----
         all_data = perform_tile_extraction(config, project, combination_dict)
 
         # ---- Feature extraction ----
+        feature_string = id_strings["feature_string"]
         features_folder_path = os.path.join(bags_base, feature_string)
 
         if torch.cuda.is_available():
@@ -536,23 +609,23 @@ def benchmark_sis(config, project):
         else:
             check_precomputed_features(all_data, features_folder_path) 
             logging.info("No GPU detected. Skipping feature extraction and using precomputed features.") 
+        
+        if config["experiment"].get("feature_extraction_only", False):
+            logging.info("Feature extraction only mode enabled; skipping remaining steps.")
+            continue
 
         # ---- Mosaic creation ----
         if validator.is_patch_extractor(combination_dict.get("feature_extraction")):
-            mosaic = combination_dict['mosaic_selector']
-            if "-" in mosaic:
-                mosaic_selector, mosaic_percentile = mosaic.split("-")
-                mosaic_percentile = None if mosaic_percentile.lower() == "none" else int(mosaic_percentile)
-            else:
-                mosaic_selector = mosaic
-                mosaic_percentile = None
+            mosaic_selector = combination_dict["mosaic_selector"].lower()
+            selector_params = combination_dict.get("mosaic_selector_params", {})
+            sel_with_params = id_strings["selector_full"] 
 
             logging.info(f"Running {mosaic_selector} patch selection...")
             slide_mosaic_paths = create_slide_mosaic_mp(
                                         config=config, 
                                         all_data=all_data,
-                                        selector=mosaic_selector, 
-                                        percentile=mosaic_percentile, 
+                                        selector_name=mosaic_selector,
+                                        selector_params=selector_params, 
                                         mosaics_base=mosaics_base,
                                         features_folder_path=features_folder_path, 
                                         patch_size=combination_dict['tile_px'], 
@@ -564,10 +637,7 @@ def benchmark_sis(config, project):
             # ---- Patch visualization (multi-page PDF) ----
             logging.info("Creating mosaic patch visualizations...")
 
-            if "features" in mosaic_selector:
-                pdf_base = os.path.join(vis_base, f"mosaics_{mosaic_selector}_{tile_string}_{feature_string}")
-            else:
-                pdf_base = os.path.join(vis_base, f"mosaics_{mosaic_selector}_{tile_string}")
+            pdf_base = os.path.join(vis_base, f"mosaics_{sel_with_params}_{feature_string}")
 
             if "patch_selection" in visualization_cfg:
                 try:
@@ -577,7 +647,7 @@ def benchmark_sis(config, project):
                         slide_mosaic_paths=slide_representation_paths,
                         mosaic_selector=mosaic_selector,
                         pdf_base=pdf_base,
-                        patch_px=combination_dict["tile_px"],
+                        patch_px=combination_dict['tile_px'],
                         patch_um=combination_dict['tile_um']
                     )
                 except Exception as e:
@@ -587,12 +657,12 @@ def benchmark_sis(config, project):
             del slide_mosaic_paths
         elif validator.is_slide_extractor(combination_dict.get("feature_extraction")):
             slide_representation_paths = create_slide_feature_paths(config, all_data, features_folder_path)
-            mosaic_selector = "slide"
-            logging.info(f"Found slide-level features for {len(slide_representation_paths)} slides in {features_folder_path}")
+            mosaic_selector = "slide"                
+            sel_with_params = mosaic_selector        
 
         # ---- Generate UMAP plots (if requested) ----
         if "umap" in visualization_cfg:
-            umap_base = os.path.join(vis_base, f"umap_{mosaic_selector}_{feature_string}")
+            umap_base = os.path.join(vis_base, f"umap_{sel_with_params}_{feature_string}")
             umap_cfg = visualization_cfg["umap"]
             run_umap_visualizations(
                 umap_cfg=umap_cfg,
@@ -603,32 +673,27 @@ def benchmark_sis(config, project):
                 random_state=config["experiment"].get("random_state", None)
             )
 
-        # ---- Similar Image Search Benchmark ----
-        available = list_search_methods()
-        logging.info("Registered search methods: %s", ", ".join(available) or "(none)")
-        
-        search_string = combination_dict.get('search_method', 'yottixel-10')
-        search_parts = search_string.split('-', 1)
-        search_method = search_parts[0]
-        k = int(search_parts[1]) if len(search_parts) > 1 and search_parts[1].isdigit() else 5
-
-        logging.info(f"Running leave-one-patient-out evaluation using {search_method} retrieving {k} slides...")
+        # ---- Similar Image Search Benchmark ----   
+        search_method = combination_dict['search_method'].lower()
+        search_params = combination_dict.get('search_method_params', {})
+        search_params["mosaic_string"] = id_strings["mosaic_string"]
 
         searcher = build_search_method(
             name=search_method,
             config=config,
             slide_representation_paths=slide_representation_paths,
-            k=k,
-            # harmless for methods that don't use it; constructors accept **kwargs
-            mosaic_string=f"{mosaic_selector}_{feature_string}",
+            params=search_params,
         )
 
+        search_with_params = id_strings["search_full"] 
+
+        logging.info(f"Running leave-one-patient-out evaluation using {search_method} retrieving {searcher.k} slides...")
         results = searcher.leave_one_patient_out()
 
         logging.info(f"Leave-one-patient-out completed with {len(results)} queries.")
 
         # ---- Save retrieval results ----
-        combo_eval_folder = os.path.join(eval_base, f"{search_method}_{mosaic_selector}_{feature_string}")
+        combo_eval_folder = os.path.join(eval_base, f"{search_with_params}_{sel_with_params}_{feature_string}")
         os.makedirs(combo_eval_folder, exist_ok=True)
 
         save_retrieval_results_to_excel(
@@ -646,10 +711,11 @@ def benchmark_sis(config, project):
                 )
             except Exception as e:
                 logging.warning(
-                    f"Retrieval visualization failed for {search_method}_{mosaic_selector}_{feature_string}: {e}"
+                    f"Retrieval visualization failed for {search_with_params}_{sel_with_params}_{feature_string}: {e}"
                 )
 
             logging.info("Image retrieval visualizations saved to PDF.")
+
         # ---- Metric Evaluation ----
         raw_metrics = config['experiment'].get("evaluation", []) or []
         valid_metrics = [m for m in raw_metrics if re.match(r'^(hit|mmv|map)_at_\d+$', m)]
@@ -663,7 +729,7 @@ def benchmark_sis(config, project):
             else:
                 logging.info("Metric computation returned no results; skipping save.")
         
-        completed.add(combo_id)
+        completed.add(id_strings["combo_id"])
         with open(checkpoint_path,'w') as f:
             json.dump(sorted(completed), f, indent=2)
 

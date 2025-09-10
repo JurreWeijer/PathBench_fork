@@ -4,7 +4,7 @@ import gc
 import logging
 import pickle
 from collections import OrderedDict, defaultdict, Counter
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -54,7 +54,6 @@ def log_mem(tag):
     logging.info(f"[{tag}] RSS={rss:.2f} GB  kids={kids:.2f} GB  "
                  f"CUDA alloc/res={alloc:.0f}/{reserv:.0f} MB  /dev/shm={shm:.2f} GB")
 
-
 @register_search_methods
 class SISHSearch(SearchMethodBase):
     """
@@ -65,14 +64,58 @@ class SISHSearch(SearchMethodBase):
     name = "sish"
     supports = {"patch"}
 
-    def __init__(
-        self,
-        config: dict,
-        slide_representation_paths: Dict[str, str],
-        k: int,
-        mosaic_string: str,
-        **kwargs
-    ) -> None:
+    HYPERPARAMS = {
+        # retrieval depth (kept for consistency across methods)
+        "k":                {"type": int, "default": 10, "min": 1,   
+                             "help": "top-k retrieval depth", 
+                             "attr": "k",
+                             "include_in_id": True, "id_order": 0,
+                             },
+        # SISH traversal knobs
+        "seed_interval_c":  {"type": int, "default": 50, "min": 1,   
+                             "help": "seed index stride",
+                             "attr": "seed_interval_c",
+                             "include_in_id": True, "id_order": 1,
+                             },
+        "seed_fanout_t":    {"type": int, "default": 10, "min": 1,   
+                             "help": "seeds per side",
+                             "attr": "seed_fanout_t",
+                             "include_in_id": True, "id_order": 2,
+                             },
+        "pre_step":         {"type": int, "default": 375, "min": 0,   
+                             "help": "max predecessor steps",
+                             "attr": "pre_step",
+                             "include_in_id": True, "id_order": 3,
+                             },
+        "succ_step":        {"type": int, "default": 375, "min": 0,
+                             "help": "max successor steps",
+                             "attr": "succ_step",
+                             "include_in_id": True, "id_order": 4,
+                             },
+        "hamming_thr":      {"type": int, "default": 512, "min": 0,   
+                             "help": "acceptance threshold",
+                             "attr": "hamming_thr",
+                             "include_in_id": True, "id_order": 5,
+                             },
+        # index build / output behavior
+        "resume_shards":    {"type": bool, "default": True,
+                             "help": "resume shard building",
+                             "attr": "resume_shards",
+                             "include_in_id": False, "id_order": 6,
+                            },
+        "shard_size":       {"type": int, "default": 25, "min": 1,
+                             "help": "slides per shard",
+                             "attr": "shard_size",
+                             "include_in_id": False, "id_order": 7,
+                            },
+        "return_patch_matches": {"type": bool, "default": False,
+                                 "help": "emit patch-level matches",
+                                 "attr": "return_patch_matches",
+                                 "include_in_id": False, "id_order": 8,
+                                 },
+        }
+
+    def __init__(self, config: dict, slide_representation_paths: Dict[str, str], params: Dict, **kwargs) -> None:
         """
         Initialize the SISHDatabase.
 
@@ -95,47 +138,43 @@ class SISHSearch(SearchMethodBase):
             pool_layers (List[nn.Module]): Pooling layers for hierarchical sums.
             pool (Pool): Multiprocessing pool for semantic mapping.
         """
-        super().__init__(config=config, slide_representation_paths=slide_representation_paths, k=k, **kwargs)
+        super().__init__(config=config, slide_representation_paths=slide_representation_paths, params=params, **kwargs)
                 # Keep your existing names so downstream code stays unchanged
-        self.slide_representations_paths = self.paths
-        self.topk = self.k
-        self.mosaic_string = mosaic_string
+        
+        try:
+            self.mosaic_string = self.params["mosaic_string"]
+        except KeyError:
+            raise ValueError("SISHSearch requires 'mosaic_string' in params (not a hyperparam).")
+
+        if self.return_patch_matches:
+            raise NotImplementedError(
+                "return_patch_matches=True is not supported: 'patch_name' is not stored in meta."
+            )
 
         # Derive the old is_patch flag from the validated mode
         self.is_slide = (self.mode == "slide") 
-        self.return_patch_matches = False
 
         # ---- create directories for index storage ----
         project_dir = os.path.join("experiments", self.config['experiment']['project_name'])
         sish_dir = os.path.join(project_dir, "sish")
         os.makedirs(sish_dir, exist_ok=True)
-        self.index_veb_path = os.path.join(sish_dir, f"veb_{mosaic_string}.pkl")
-        self.meta_database_path = os.path.join(sish_dir, f"meta_{mosaic_string}.pkl")
+        self.index_veb_path = os.path.join(sish_dir, f"veb_{self.mosaic_string}.pkl")
+        self.meta_database_path = os.path.join(sish_dir, f"meta_{self.mosaic_string}.pkl")
 
         # ---- load slide-level annotations ----
         annotations_path = self.config['experiment']['annotation_file']
         self.annotations = pd.read_csv(annotations_path).set_index('slide')
         logging.info(f"Loaded annotations for {len(self.annotations)} slides from {annotations_path}")
 
-        # ---- initialize VQ-VAE encoder and codebook ----
+        # ---- SISH metrics paths; heavy objects deferred ----
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        codebook_path = self.config["SISH_metrics"]["codebook_semantic"]
-        checkpoint_path = self.config["SISH_metrics"]["vqvae_checkpoint"]
-        self.codebook_semantic = torch.load(codebook_path)
-        logging.debug(f"Loaded semantic codebook from {codebook_path}")
+        
+        self._codebook_path   = None
+        self._checkpoint_path = None
 
-        self.vqvae = LargeVectorQuantizedVAE_Encode(code_dim=256, code_size=128)
-        self.transform_vqvqe = transforms.Lambda(scale_to_minus1_to_1)
-
-        raw_checkpoint = torch.load(checkpoint_path)['model']
-        enc_weights = OrderedDict({
-            k[len("module."):]: v
-            for k, v in raw_checkpoint.items()
-            if k.startswith("module.encoder.") or k.startswith("module.codebook.")
-        })
-        self.vqvae.load_state_dict(enc_weights)
-        self.vqvae.to(self.device).eval()
-        logging.info("VQ-VAE encoder weights loaded; model set to eval mode.")
+        self.codebook_semantic = None
+        self.vqvae = None
+        self.transform_vqvqe = None
 
         # ---- setup pooling layers for hierarchical sums ----
         self.pool_layers = [
@@ -149,6 +188,39 @@ class SISHSearch(SearchMethodBase):
         self.keys = []   # flat list of all keys for VEB
         self.vebtree = None
         self.pool = None
+    
+    def _ensure_vqvae_ready(self) -> None:
+        """Lazy-load the SISH VQ-VAE encoder, codebook, and transforms if not already loaded."""
+        if self.vqvae is not None and self.codebook_semantic is not None and self.transform_vqvqe is not None:
+            return
+        
+        sish_metrics = self.config["experiment"].get("SISH_metrics", {})
+        
+        self._codebook_path   = sish_metrics.get("codebook_semantic")
+        self._checkpoint_path = sish_metrics.get("vqvae_checkpoint")
+        if self._codebook_path is None or self._checkpoint_path is None:
+            raise RuntimeError("SISH required but missing paths in experiment.SISH_metrics (need 'codebook_semantic' and 'vqvae_checkpoint').")
+
+        # Load codebook (CPU is fine; it’s small)
+        self.codebook_semantic = torch.load(self._codebook_path, map_location="cpu")
+        logging.debug(f"Loaded semantic codebook from {self._codebook_path}")
+
+        # Create encoder and load only encoder+codebook weights from checkpoint
+        self.vqvae = LargeVectorQuantizedVAE_Encode(code_dim=256, code_size=128)
+        raw = torch.load(self._checkpoint_path, map_location="cpu")["model"]
+        enc_weights = OrderedDict({
+            k[len("module."):]: v
+            for k, v in raw.items()
+            if k.startswith("module.encoder.") or k.startswith("module.codebook.")
+        })
+        missing, unexpected = self.vqvae.load_state_dict(enc_weights, strict=False)
+        if missing or unexpected:
+            logging.debug(f"VQ-VAE load_state: missing={missing}, unexpected={unexpected}")
+
+        self.vqvae.to(self.device).eval()
+        self.transform_vqvqe = transforms.Lambda(scale_to_minus1_to_1)
+
+    logging.info("VQ-VAE & codebook ready (lazy-initialized).")
 
     def build_index(self) -> None:
         """
@@ -164,13 +236,16 @@ class SISHSearch(SearchMethodBase):
           3. Construct the VEB tree over all keys.
           4. Save the VEB tree and metadata to disk.
         """
+
+        self._ensure_vqvae_ready()
+
         # ---- reset accumulators ----
         self.meta.clear()
         self.keys.clear()
         logging.info("Reset metadata and key lists before index build.")
 
         # ---- iterate slides to populate keys + meta ----
-        for slide_id, mosaic_pkl in self.slide_representations_paths.items():
+        for slide_id, mosaic_pkl in self.paths.items():
             label = self.annotations.at[slide_id, 'category']
             patient_id = self.annotations.at[slide_id, 'patient']
             logging.debug(f"Indexing slide {slide_id}: category={label}, patient={patient_id}")
@@ -251,13 +326,21 @@ class SISHSearch(SearchMethodBase):
         with open(self.meta_database_path, 'wb') as f:
             pickle.dump(self.meta, f)
         logging.info(f"Saved VEB tree to {self.index_veb_path!r} and metadata to {self.meta_database_path!r}")
-    
-    def build_index_shards(self, resume: bool = True, shard_size: int = 25) -> None:
+        
+    def build_index_shards(self, resume: Optional[bool] = None, shard_size: Optional[int] = None) -> None:
         """
         Build the VEB index with resumable checkpoints.
         - Stores partial self.meta/self.keys to disk in shards every `shard_size` slides.
         - On resume, skips finished slides and continues.
         """
+
+        self._ensure_vqvae_ready()
+
+        if resume is None:
+            resume = bool(self.resume_shards)   # from params/HYPERPARAMS
+        if shard_size is None:
+            shard_size = int(self.shard_size)   # from params/HYPERPARAMS
+        
         # -------- paths --------
         project_dir = os.path.join("experiments", self.config['experiment']['project_name'])
         sish_dir    = os.path.join(project_dir, "sish")
@@ -314,7 +397,7 @@ class SISHSearch(SearchMethodBase):
                 json.dump(mani, f, indent=2)
 
         # -------- main loop --------
-        to_iterate = list(self.slide_representations_paths.items())
+        to_iterate = list(self.paths.items())
         logging.info("Reset metadata and key lists before index build." if not processed_slides else
                     "Continuing metadata build.")
 
@@ -417,16 +500,6 @@ class SISHSearch(SearchMethodBase):
 
         logging.info(f"Saved VEB tree to {self.index_veb_path!r} and metadata to {self.meta_database_path!r}")
 
-        # optional: clean shards
-        #try:
-        #    for fn in os.listdir(shard_dir):
-        #        if fn.endswith((".pkl", ".npy")):
-        #            os.remove(os.path.join(shard_dir, fn))
-        #    os.remove(manifest_path)
-        #    os.rmdir(shard_dir)
-        #except OSError:
-        #    pass
-
     def leave_one_patient(self, patient_id: str) -> None:
         """
         Exclude all entries for a given patient from the metadata.
@@ -457,11 +530,6 @@ class SISHSearch(SearchMethodBase):
         query_index: int, 
         dense_feat: str, 
         patient_id: str, 
-        pre_step: int, 
-        succ_step: int, 
-        C: int, 
-        T: int, 
-        thrsh: int
     ) -> list:
         """
         Implements the bidirectional VEB-guided search from the SISH paper.
@@ -470,11 +538,6 @@ class SISHSearch(SearchMethodBase):
             query_index (int): Integer index of the query latent code.
             dense_feat (str): Binary string representing quantized DenseNet features.
             patient_id (str): Patient ID to exclude from retrieval.
-            pre_step (int): Number of predecessors to traverse in backward search.
-            succ_step (int): Number of successors to traverse in forward search.
-            C (int): Interval width factor for seed index expansion.
-            T (int): Number of times to expand the seed index on each side.
-            thrsh (int): Hamming-distance threshold for accepting candidates.
 
         Returns:
             list of tuples: Each tuple is either
@@ -485,15 +548,15 @@ class SISHSearch(SearchMethodBase):
                  patch_name, category)
             for patch-mode.
         """
-        logging.info(f"Starting search for query_index={query_index}, patient_id={patient_id}")
+        #logging.info(f"Starting search for query_index={query_index}, patient_id={patient_id}")
 
         # ---- section: generate seed indices ----
         seed_index = []
-        seed_index_pre = [int(query_index - m * C * 1e11) for m in range(T)]
-        seed_index_succ = [int(query_index + m * C * 1e11) for m in range(T)]
+        seed_index_pre = [int(query_index - m * self.seed_interval_c * 1e11) for m in range(self.seed_fanout_t)]
+        seed_index_succ = [int(query_index + m * self.seed_interval_c * 1e11) for m in range(self.seed_fanout_t)]
         seed_index.extend(seed_index_pre)
         seed_index.extend(seed_index_succ)
-        logging.debug(f"Generated {len(seed_index)} seed indices (pre + succ)")
+        #logging.debug(f"Generated {len(seed_index)} seed indices (pre + succ)")
 
         # ---- section: prepare results container ----
         res = []
@@ -504,7 +567,7 @@ class SISHSearch(SearchMethodBase):
             # ---- backward search ----
             pre_prev = index
             p_count = 0
-            while p_count < pre_step:
+            while p_count < self.pre_step:
                 pre = self.vebtree.predecessor(pre_prev)
                 if pre is None or pre in visited:
                     break
@@ -516,7 +579,7 @@ class SISHSearch(SearchMethodBase):
                     #logging.info(f"No candidates found for index {pre}; skipping")
                     pre_prev = pre
                     continue
-                logging.info(f"Found {len(candidates_clean)} candidates for index {pre}")
+                #logging.info(f"Found {len(candidates_clean)} candidates for index {pre}")
 
                 # ---- compute hamming distances ----
                 if len(candidates_clean) > 1:
@@ -528,12 +591,12 @@ class SISHSearch(SearchMethodBase):
                     hamming_dist = hamming_bytes(candidates_clean[0]['bits'], dense_feat)
 
                 # ---- accept candidate if within threshold ----
-                if hamming_dist <= thrsh:
-                    logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {thrsh}")
+                if hamming_dist <= self.hamming_thr:
+                    #logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {self.hamming_thr}")
                     entry = candidates_clean[min_idx]
                     visited[pre] = True
                     if not self.return_patch_matches:
-                        logging.info(f"Slide mode: {entry['slide_name']}")
+                        #logging.info(f"Slide mode: {entry['slide_name']}")
                         res.append((
                             query_index,
                             pre,
@@ -554,8 +617,8 @@ class SISHSearch(SearchMethodBase):
                             entry['patch_name'],
                             entry['category'],
                         ))
-                else:
-                    logging.info(f"Hamming distance {hamming_dist} exceeds threshold {thrsh}; skipping")
+                #else:
+                #    logging.info(f"Hamming distance {hamming_dist} exceeds threshold {self.hamming_thr}; skipping")
 
                 p_count += 1
                 pre_prev = pre
@@ -563,7 +626,7 @@ class SISHSearch(SearchMethodBase):
             # ---- forward search ----
             succ_prev = index
             s_count = 0
-            while s_count < succ_step:
+            while s_count < self.succ_step:
                 succ = self.vebtree.successor(succ_prev)
                 if succ is None or succ in visited:
                     break
@@ -571,10 +634,10 @@ class SISHSearch(SearchMethodBase):
                 candidates_clean = [e for e in candidates if e['patient_id'] != patient_id]
 
                 if not candidates_clean:
-                    logging.info(f"No candidates found for index {succ}; skipping")
+                    #logging.info(f"No candidates found for index {succ}; skipping")
                     succ_prev = succ
                     continue
-                logging.info(f"Found {len(candidates_clean)} candidates for index {succ}")
+                #logging.info(f"Found {len(candidates_clean)} candidates for index {succ}")
 
                 if len(candidates_clean) > 1:
                     dists = [hamming_bytes(e['bits'], dense_feat) for e in candidates_clean]
@@ -584,12 +647,12 @@ class SISHSearch(SearchMethodBase):
                     min_idx = 0
                     hamming_dist = hamming_bytes(candidates_clean[0]['bits'], dense_feat)
 
-                if hamming_dist <= thrsh:
-                    logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {thrsh}")
+                if hamming_dist <= self.hamming_thr:
+                    #logging.info(f"Accepted candidate with hamming distance {hamming_dist} <= {self.hamming_thr}")
                     entry = candidates_clean[min_idx]
                     visited[succ] = True
                     if not self.return_patch_matches:
-                        logging.info(f"Accepted candidate: {entry}")
+                        #logging.info(f"Accepted candidate: {entry}")
                         res.append((
                             query_index,
                             succ,
@@ -610,27 +673,19 @@ class SISHSearch(SearchMethodBase):
                             entry['patch_name'],
                             entry['category'],
                         ))
-                else:
-                    logging.info(f"Hamming distance {hamming_dist} exceeds threshold {thrsh}; skipping")
+                #else:
+                    #logging.info(f"Hamming distance {hamming_dist} exceeds threshold {self.hamming_thr}; skipping")
                     
                 s_count += 1
                 succ_prev = succ
 
-        logging.warning(f"Search completed: found {len(res)} candidate(s)")
+        #logging.warning(f"Search completed: found {len(res)} candidate(s)")
 
         return res
 
+    """
     def preprocessing(self, latent: np.ndarray) -> np.ndarray:
-        """
-        Convert VQ-VAE latent code into integer index (or indices).
-
-        Args:
-            latent (np.ndarray): Latent map(s) from the VQ-VAE encoder, shape (H, W) or (N, H, W).
-
-        Returns:
-            np.ndarray: Integer index (or array of indices) representing each latent map.
-        """
-        logging.info("Running preprocessing to convert latent code(s) to index")
+        #logging.info("Running preprocessing to convert latent code(s) to index")
 
         # ---- compute index via internal helper ----
         mosaic_index = self._slide_to_index(latent)
@@ -641,8 +696,9 @@ class SISHSearch(SearchMethodBase):
             length = len(mosaic_index)
         except TypeError:
             length = 1
-        logging.debug(f"Preprocessing produced {length} index value(s)")
+        #logging.debug(f"Preprocessing produced {length} index value(s)")
         return mosaic_index
+    """
 
     def postprocessing(self, res_tmp: list) -> list:
         """
@@ -661,7 +717,7 @@ class SISHSearch(SearchMethodBase):
         Returns:
             list of dict: Each dict maps field names to tuple values, sorted by hamming distance.
         """
-        logging.warning(f"Postprocessing {len(res_tmp)} raw search result(s)")
+        #logging.warning(f"Postprocessing {len(res_tmp)} raw search result(s)")
 
         # ---- sort by hamming distance (4th element) ----
         res_srt = sorted(res_tmp, key=lambda x: x[3])
@@ -674,7 +730,7 @@ class SISHSearch(SearchMethodBase):
                            'slide_name', 'category', 'patient_id', 'x', 'y']
         # ---- build list of dicts ----
         res_srt_dict = [dict(zip(field_names, tup)) for tup in res_srt]
-        logging.warning(f"Postprocessing returned {len(res_srt_dict)} formatted entries")
+        #logging.warning(f"Postprocessing returned {len(res_srt_dict)} formatted entries")
         return res_srt_dict
 
     def query(
@@ -682,11 +738,6 @@ class SISHSearch(SearchMethodBase):
         index: int,
         dense_feat: str,
         patient_id: str,
-        pre_step: int = 375,
-        succ_step: int = 375,
-        C: int = 50,
-        T: int = 10,
-        thrsh: int = 512
     ) -> list:
         """
         Perform a single leave-one-patient-out query.
@@ -695,11 +746,6 @@ class SISHSearch(SearchMethodBase):
             index (int): Integer index of the query latent code.
             dense_feat (str): Binarized DenseNet feature string for the query.
             patient_id (str): Patient ID to exclude during search.
-            pre_step (int): Number of backward VEB steps (default 375).
-            succ_step (int): Number of forward VEB steps (default 375).
-            C (int): Interval width factor for seed expansion (default 50).
-            T (int): Number of seed expansions on each side (default 10).
-            thrsh (int): Hamming distance threshold for candidate acceptance (default 128).
 
         Returns:
             list of dict: Top-k retrieval results, each dict containing:
@@ -708,24 +754,19 @@ class SISHSearch(SearchMethodBase):
                 - predicted_label
                 - top_k: list of {slide_id, label, distance}
         """
-        logging.info(f"Querying index={index} (patient_id={patient_id}) with topk={self.topk}")
+        #logging.info(f"Querying index={index} (patient_id={patient_id}) with topk={self.k}")
 
         # ---- run raw search ----
         indices_nn = self.search(
             index,
             dense_feat,
             patient_id,
-            pre_step=pre_step,
-            succ_step=succ_step,
-            C=C,
-            T=T,
-            thrsh=thrsh
         )
-        logging.warning(f"Raw search returned {len(indices_nn)} entries")
+        #logging.info(f"Raw search returned {len(indices_nn)} entries")
 
         # ---- format via postprocessing ----
         results = self.postprocessing(indices_nn)
-        logging.warning(f"Postprocessed to {len(results)} formatted entries")
+        #logging.info(f"Postprocessed to {len(results)} formatted entries")
 
         return results
     
@@ -755,7 +796,7 @@ class SISHSearch(SearchMethodBase):
             # fallback to uniform if nothing left
             return {lbl: 1.0 for lbl in total_per_label}
 
-        norm_fact = self.topk / inv_sum
+        norm_fact = self.k / inv_sum
         weights = {lbl: norm_fact * (1.0 / cnt) for lbl, cnt in total_per_label.items()}
 
         logging.debug(f"Database counts per label: {total_per_label}")
@@ -786,11 +827,19 @@ class SISHSearch(SearchMethodBase):
         # 1) compute uncertainties
         bag_summary = []
         label_count_summary = {}
+
         for idx, bag in enumerate(bags):
+            # bag is a list of dicts from self.query(...), each has 'hamming_dist'
+            hams = [entry['hamming_dist'] for entry in bag]
+            hams.sort()
+
             ent, label_count, _ = Uncertainty_Cal(bag, weights)
-            if ent is not None:
+
+            # Skip empty bags if your Clean() can’t handle them
+            if ent is not None and hams:
                 label_count_summary[idx] = label_count
-                bag_summary.append((idx, ent, None, len(bag)))
+                # (bag_index, entropy, list_of_hamming_distances, bag_len)
+                bag_summary.append((idx, ent, hams, len(hams)))
 
         # 2) Hamming‐based clean & prediction filtering
         lengths = [b[3] for b in bag_summary]
@@ -798,7 +847,7 @@ class SISHSearch(SearchMethodBase):
         removed = Filtered_BY_Prediction(bag_summary, label_count_summary)
 
         # 3) assemble top‐k
-        retrieval_final = []
+        ret_final = []
         visited = set()
         for bag_idx, unc, _, _ in bag_summary:
             for entry in bags[bag_idx]:
@@ -806,15 +855,19 @@ class SISHSearch(SearchMethodBase):
                 hd  = entry['hamming_dist']
                 lbl = entry.get('diagnosis', entry.get('category'))
                 if unc == 0 or (hd <= hamming_thr and sid not in visited):
-                    retrieval_final.append((sid, hd, lbl))
+                    ret_final.append((sid, hd, lbl, unc, bag_idx))
                     visited.add(sid)
 
         # sort & truncate
-        retrieved = sorted(retrieval_final, key=lambda x: x[1])[:self.topk]
-        top_k_info = [
-            {"slide_id": sid, "label": lbl, "distance": float(dist)}
-            for sid, dist, lbl in retrieved
-        ]
+        ret_final = [e for e in sorted(ret_final, key=lambda x: (x[3], x[1]))
+                     if e[-1] not in removed
+                     ]
+        logging.info(f"[SISH] Retrieved {len(ret_final)} candidates after cleaning for slide {slide_id}")
+
+        top_k_info = [{"slide_id": sid, "label": lbl, "distance": float(hd)}
+                      for (sid, hd, lbl, _, _) in ret_final[: self.k]
+                      ]
+        
         predicted = (Counter([d["label"] for d in top_k_info])
                     .most_common(1)[0][0] if top_k_info else None)
 
@@ -829,6 +882,7 @@ class SISHSearch(SearchMethodBase):
         """
         Leave‐one‐patient‐out retrieval benchmark.
         """
+        logging.info(f"Looking for index files, VEB tree at {self.index_veb_path} and metadata at {self.meta_database_path} ")
         if os.path.exists(self.index_veb_path) and os.path.exists(self.meta_database_path):
             # both files are there -> load them
             with open(self.index_veb_path, 'rb') as f:
@@ -843,7 +897,7 @@ class SISHSearch(SearchMethodBase):
             self.build_index_shards()
 
         topk_results = []
-        for slide_id in self.slide_representations_paths:
+        for slide_id in self.paths:
             patient_id = self.annotations.at[slide_id, 'patient']
             label      = self.annotations.at[slide_id, 'category']
 
@@ -856,7 +910,7 @@ class SISHSearch(SearchMethodBase):
 
             # run the per‐patch query
             slide_outputs = [self.query(idx, feat, patient_id) for idx, feat in patient_indexes]
-            logging.warning(f"{len(slide_outputs)} number of retrieval for slide {slide_id}")
+            logging.info(f"{len(slide_outputs)} retrieved slides for slide {slide_id}")
 
             # compute weights excluding this patient
             weights = self.compute_database_weights(patient_id)
@@ -901,7 +955,7 @@ class SISHSearch(SearchMethodBase):
 
         # ---- compute weights (inverse-frequency) ----
         inv_sum = sum(1.0 / cnt for cnt in total_per_label.values() if cnt > 0)
-        norm_fact = self.topk / inv_sum
+        norm_fact = self.k / inv_sum
         weight = {label: norm_fact * (1.0 / cnt) for label, cnt in total_per_label.items()}
         logging.debug(f"Computed label weights: {weight}")
 
@@ -953,8 +1007,8 @@ class SISHSearch(SearchMethodBase):
                             retrieval_final.append((sid, hd, lbl))
                             visited.add(sid)
 
-                # ---- sort, filter removed, limit to self.topk ----
-                retrieved = sorted(retrieval_final, key=lambda x: x[1])[:self.topk]
+                # ---- sort, filter removed, limit to self.k ----
+                retrieved = sorted(retrieval_final, key=lambda x: x[1])[:self.k]
                 top_k_info = [
                     {"slide_id": sid, "label": lbl, "distance": float(dist)}
                     for sid, dist, lbl in retrieved

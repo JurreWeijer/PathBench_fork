@@ -1,13 +1,21 @@
 import slideflow as sf
 import numpy as np
 import joblib
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from shapely.geometry import Polygon, box
 import os
 import pandas as pd
 import json
 import torch
 import logging
+import hashlib
+import re
+
+# Import the registry resolvers (no instantiation happens in these)
+from pathbench.image_retrieval.search_methods.registry import get_search_method_values
+from pathbench.image_retrieval.mosaic_selectors.registry import get_mosaic_selector_values
+
+from itertools import product
 
 logger = logging.getLogger(__name__)
 
@@ -443,3 +451,210 @@ def cleanup_dev_shm():
                 os.unlink(path)
             except OSError:
                 pass
+
+def calculate_combinations(config: dict) -> list:
+    """
+    Calculate all parameter combinations based on benchmark_parameters.
+
+    Accepts list items that are either:
+      - plain strings: "method_name"
+      - single-key dicts: {"method_name": {"param": value, ...}}
+
+    Returns:
+        list[dict]: One dict per combination. For any list-valued key K,
+                    - if the chosen item is a string -> combo[K] = "name"
+                    - if the chosen item is a dict  -> combo[K] = "name" and
+                                                      combo[f"{K}_params"] = { ... }  (only if non-empty)
+    """
+    bp = config.get("benchmark_parameters", {})
+    # Only include keys whose values are lists (same as your original behavior)
+    keys = [k for k, v in bp.items() if isinstance(v, list)]
+
+    # Build the grid of values for each key
+    value_lists = []
+    method_like_keys = set()
+    for k in keys:
+        values = bp[k]
+        if not values:
+            value_lists.append([None])
+            continue
+
+        # Detect if this key uses the "method" style (strings or single-key dicts)
+        is_method_like = all(isinstance(x, (str, dict)) for x in values)
+        if is_method_like:
+            method_like_keys.add(k)
+
+            normalized = []
+            for item in values:
+                if isinstance(item, str):
+                    normalized.append( (item.strip(), {}) )
+                elif isinstance(item, dict):
+                    # Expect single-key dict: { "name": {params...} } or { "name": {} }
+                    if len(item) != 1:
+                        raise ValueError(f"List item for '{k}' must be a single-key mapping, got: {item}")
+                    name, params = next(iter(item.items()))
+                    if not isinstance(name, str):
+                        raise ValueError(f"Method name for '{k}' must be a string, got: {type(name)}")
+                    if params is None:
+                        params = {}
+                    elif not isinstance(params, dict):
+                        raise ValueError(f"Params for '{k}:{name}' must be a mapping, got: {type(params)}")
+                    normalized.append( (name.strip(), params) )
+                else:
+                    raise ValueError(f"Unsupported item type in '{k}': {type(item)}")
+            value_lists.append(normalized)
+        else:
+            # Numeric/scalar lists (e.g., tile_px, tile_um, etc.)
+            value_lists.append(values)
+
+    # Cartesian product over all keys
+    combos = []
+    for choice_tuple in product(*value_lists):
+        combo = {}
+        for k, choice in zip(keys, choice_tuple):
+            if k in method_like_keys:
+                name, params = choice  # tuple(str, dict)
+                combo[k] = name
+                if params:  # only add when non-empty
+                    combo[f"{k}_params"] = params
+            else:
+                combo[k] = choice
+        combos.append(combo)
+
+    return combos
+
+def _fmt_val(v: Any) -> str:
+    """Stable value formatting for IDs."""
+    if isinstance(v, float):
+        # Trim trailing zeros but stay readable; keep small epsilon to avoid '-0.0'
+        s = f"{v:.6g}"
+        return re.sub(r"(\.0+|(?<=\.\d)0+)$", "", s)
+    if isinstance(v, (list, tuple)):
+        return "[" + ",".join(_fmt_val(x) for x in v) + "]"
+    if isinstance(v, dict):
+        # stable key ordering
+        return "{" + ",".join(f"{k}:{_fmt_val(v[k])}" for k in sorted(v)) + "}"
+    return str(v)
+
+def _slug(s: str) -> str:
+    """Make strings path-safe and compact."""
+    s = str(s)
+    s = s.strip().replace(" ", "")
+    s = re.sub(r"[^A-Za-z0-9._\-]", "_", s)
+    return s
+
+def _stable_hash(obj: Any, n: int = 6) -> str:
+    """Short, stable hash (base16 truncated)."""
+    payload = json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.md5(payload).hexdigest()[:n]
+
+def _items_from_spec_and_values(spec: Dict[str, Dict[str, Any]],
+                                values: Dict[str, Any]) -> list:
+    """
+    Convert spec+values into ordered items:
+    (order, label, key, value) filtered by include_in_id.
+    """
+    items = []
+    for key, meta in (spec or {}).items():
+        if not meta.get("include_in_id", True):
+            continue
+        if key not in values:
+            continue
+        val = values[key]
+        label = meta.get("id_label", key)
+        order = meta.get("id_order", 1_000_000)
+        items.append((order, label, key, val))
+    # stable order
+    items.sort(key=lambda t: (t[0], t[1]))
+    return items
+
+def build_param_id_string(
+    kind: str,                # "selector" or "search"
+    name: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    compact: bool = False,
+    max_len: int = 120
+) -> str:
+    """
+    Build a path-safe ID from parameter values (no heavy instantiation).
+
+    - Reads effective values via your value helpers:
+        get_mosaic_selector_values(name, params) -> dict
+        get_search_method_values(name, params)   -> dict
+    - Tries to fetch the class HYPERPARAMS to honor:
+        include_in_id (default True), id_label, id_order
+      Falls back to including all keys in alpha order if spec isn't available.
+    - If compact=True -> values only in order, e.g. '10-375-375'
+      else labeled, e.g. 'k10-pre375-succ375'
+    """
+    params = params or {}
+
+    # 1) fetch values dict
+    if kind == "selector":
+        from ..image_retrieval.utils import get_mosaic_selector_values
+        values = get_mosaic_selector_values(name, params)  # <-- dict only
+        # best-effort fetch of spec for labels/order/inclusion
+        try:
+            from ..image_retrieval.mosaic_selectors.registry import get_mosaic_selector_class
+            cls = get_mosaic_selector_class(name)
+            spec = getattr(cls, "HYPERPARAMS", {}) or {}
+        except Exception:
+            spec = {}
+    elif kind == "search":
+        from ..image_retrieval.utils import get_search_method_values
+        values = get_search_method_values(name, params)    # <-- dict only
+        try:
+            from ..image_retrieval.search_methods.registry import get_search_method_class
+            cls = get_search_method_class(name)
+            spec = getattr(cls, "HYPERPARAMS", {}) or {}
+        except Exception:
+            spec = {}
+    else:
+        raise ValueError(f"Unknown kind '{kind}' (expected 'selector' or 'search').")
+
+    if not values:
+        return ""
+
+    # 2) collect items honoring spec when available
+    items = []
+    # Prefer spec order if we have it; otherwise key-sorted values
+    keys_in_order = list(spec.keys()) if spec else sorted(values.keys())
+
+    for key in keys_in_order:
+        if key not in values:
+            continue
+        meta = spec.get(key, {})
+        if not meta.get("include_in_id", True):
+            continue
+        label = meta.get("id_label", key)
+        order = meta.get("id_order", 1_000_000)
+        items.append((order, label, key, values[key]))
+
+    # If spec was empty, we may have skipped keys not in spec; include remaining (alpha)
+    if not spec:
+        remaining = [k for k in sorted(values.keys()) if k not in {i[2] for i in items}]
+        for k in remaining:
+            items.append((1_000_000, k, k, values[k]))
+
+    if not items:
+        return ""
+
+    # 3) stable order
+    items.sort(key=lambda t: (t[0], t[1]))
+
+    # 4) build tokens
+    tokens = []
+    for _, label, key, val in items:
+        vs = _slug(_fmt_val(val))
+        tokens.append(vs if compact else f"{_slug(label)}{vs}")
+
+    param_id = "-".join(tokens)
+
+    # 5) length guard
+    if len(param_id) > max_len:
+        payload = {k: v for _, _, k, v in items}
+        h = _stable_hash(payload)
+        param_id = param_id[: max_len - 8].rstrip("-") + f"--{h}"
+
+    return param_id

@@ -23,8 +23,6 @@ from .registry import register_mosaic_selectors
 
 @register_mosaic_selectors
 class YottixelRGB(MosaicSelector):
-    name = "Yottixel_rgb"
-    param_key = "percentage_selected"
 
     """
     Yottixel RGB Mosaic Selection
@@ -51,10 +49,28 @@ class YottixelRGB(MosaicSelector):
         “Yottixel - An Image Search Engine for Large Archives of Histopathology Whole Slide Images.” Medical Image Analysis 65 
         (October 2020): 101757. https://doi.org/10.1016/j.media.2020.101757.
     """
+    name = "Yottixel_rgb"
+    HYPERPARAMS = {
+        "n_clusters":    {"type": int,   "default": 9,   "min": 1,   
+                          "help": "KMeans clusters (stage 1)", 
+                          "attr": "n_clusters",
+                          "include_in_id": True, "id_order": 0,
+                          },
+        "perc_selected": {"type": float, "default": 1.0, "min": 0.0, "max": 100.0, 
+                          "help": "Percent reps per group", 
+                          "attr": "perc_selected",
+                          "include_in_id": True, "id_order": 1,
+                          },
+    }
 
-    def run(self, patches, *, percentage_selected: int, **_):	
-        
-        kmeans_clusters = 9  # TODO: move to config if needed
+    def __init__(self, params, config):
+        super().__init__(params, config)
+        # parse + clamp
+        self.n_clusters    = self._get_hp("n_clusters")
+        self.perc_selected = self._get_hp("perc_selected")
+        self.random_state  = (self.config.get("experiment", {}) or {}).get("random_state", None)
+
+    def run(self, patches, **_):	
 
         if len(patches) == 0:
             logging.warning("Empty patch list provided to Yottixel selection.")
@@ -62,10 +78,10 @@ class YottixelRGB(MosaicSelector):
 
         # ---- Stage 1: Color clustering ----
         rgb_hist = np.array([p['rgb_histogram'] for p in patches])
-        kmeans_clusters = min(kmeans_clusters, len(patches))  # Cap clusters to number of patches
+        n_clusters = min(self.n_clusters, len(patches))  # Cap clusters to number of patches
         kmeans_color = KMeans(
-            n_clusters=kmeans_clusters,
-            random_state=self.config["experiment"].get("random_state", None)
+            n_clusters=n_clusters,
+            random_state=self.random_state
         )
         color_labels_raw = kmeans_color.fit_predict(rgb_hist)
 
@@ -81,12 +97,12 @@ class YottixelRGB(MosaicSelector):
                 continue
 
             cluster_patches = [patches[i] for i in member_idx]
-            n_select = max(1, int(len(cluster_patches) * percentage_selected / 100))
+            n_select = max(1, int(len(cluster_patches) * self.perc_selected / 100))
 
             loc_features = np.asarray([p['loc'] for p in cluster_patches], dtype=float)
             kmeans_loc = KMeans(
                 n_clusters=n_select,
-                random_state=self.config["experiment"].get("random_state", None)
+                random_state=self.random_state
             )
             dists = kmeans_loc.fit_transform(loc_features)
 
@@ -107,9 +123,6 @@ class YottixelRGB(MosaicSelector):
 
 @register_mosaic_selectors
 class YottixelFeatures(MosaicSelector):
-    name = "Yottixel_features"
-    param_key = "percentage_selected"
-
     """
     Yottixel-Features Mosaic Selection (RetCCL-Inspired)
     ---------------------------------------------------
@@ -136,21 +149,31 @@ class YottixelFeatures(MosaicSelector):
         (January 1, 2023): 102645. https://doi.org/10.1016/j.media.2022.102645.
         
     """
+    name = "Yottixel_features"
+    HYPERPARAMS = {
+        "n_clusters":    {"type": int,   "default": 9,   "min": 1,   "help": "KMeans clusters in feature space", "attr": "n_clusters"},
+        "perc_selected": {"type": float, "default": 1.0, "min": 0.0, "max": 100.0, "help": "Percent reps per group", "attr": "perc_selected"},
+    }
 
-    def run(self, patches, *, percentage_selected: int, **_):
+    def __init__(self, params, config):
+        super().__init__(params, config)
+        # parse + clamp
+        self.n_clusters    = self._get_hp("n_clusters")
+        self.perc_selected = self._get_hp("perc_selected")
+        self.random_state  = (self.config.get("experiment", {}) or {}).get("random_state", None)
+
+    def run(self, patches, **_):
 
         if len(patches) == 0:
             logging.warning("Empty patch list provided.")
             return [], np.array([], dtype=int), np.empty((0, 2), dtype=int), {}
 
-        kmeans_clusters = 9  # TODO: move to config if needed
-
         # ---- Stage 1: Feature clustering ----
         features = np.asarray([p['feature'] for p in patches], dtype=float)
-        kmeans_clusters = min(kmeans_clusters, len(patches))
+        n_clusters = min(self.n_clusters, len(patches))
         kmeans_feat = KMeans(
-            n_clusters=kmeans_clusters,
-            random_state=self.config["experiment"].get("random_state", None)
+            n_clusters=n_clusters,
+            random_state=self.random_state
         )
         feat_labels_raw = kmeans_feat.fit_predict(features)
 
@@ -169,7 +192,7 @@ class YottixelFeatures(MosaicSelector):
 
             # Gather cluster-local patches in original order
             cluster_patches = [patches[i] for i in member_idx]
-            n_select = max(1, int(len(cluster_patches) * percentage_selected / 100))
+            n_select = max(1, int(len(cluster_patches) * self.perc_selected / 100))
 
             if n_select == 1:
                 # pick the first member (same behavior as before)
@@ -180,7 +203,7 @@ class YottixelFeatures(MosaicSelector):
             locs = np.asarray([p['loc'] for p in cluster_patches], dtype=float)
             kmeans_loc = KMeans(
                 n_clusters=n_select,
-                random_state=self.config["experiment"].get("random_state", None)
+                random_state=self.random_state
             )
             dists = kmeans_loc.fit_transform(locs)
 

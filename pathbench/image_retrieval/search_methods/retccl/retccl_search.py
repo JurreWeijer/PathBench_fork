@@ -41,20 +41,41 @@ class RetCCLSlide:
 
 @register_search_methods
 class RetCCLSearch(SearchMethodBase):
-    name = "retccl"
-    supports = {"patch"}
 
     """
     RETCCL-based retrieval with YottixelDatabase-compatible I/O.
     No separate organ/tumor branches; single path as requested.
     """
-    
-    def __init__(self, config: dict, slide_representation_paths: dict, k: int = 5,
-                 cosine_threshold: float = 0.7, **kwargs):
-        # Base sets: self.config, self.paths, self.k, self.mode (validated)
-        super().__init__(config=config, slide_representation_paths=slide_representation_paths, k=k, **kwargs)
+    name = "retccl"
+    supports = {"patch"}
 
-        self.cosine_threshold = cosine_threshold
+    HYPERPARAMS = {
+        "k": {"type": int, "default": 5, "min": 1, 
+              "help": "retrieval depth", 
+              "attr": "k",
+              "include_in_id": True, "id_order": 0
+              },
+        "cosine_threshold": {"type": float, "default": 0.7, "min": 0.0, "max": 1.0,
+                             "help": "min cosine similarity to accept a patch match",
+                             "attr": "cosine_threshold",
+                             "include_in_id": True, "id_order": 1
+                            },
+        "class_weight_factor":{"type": float, "default": 10.0, "min": 0.0,
+                               "help": "inverse-frequency reweighting strength",
+                               "attr": "class_weight_factor",
+                               "include_in_id": True, "id_order": 2
+                            },
+        "topk_per_patch":{"type": int,   "default": 5, "min": 1,
+                          "help": "how many top sims per patch to use",
+                          "attr": "topk_per_patch",
+                          "include_in_id": True, "id_order": 3
+                        },
+    }
+    
+    def __init__(self, config: dict, slide_representation_paths: dict, params: dict, **kwargs):
+        # Base resolves ALL HYPERPARAMS and attaches them as attributes (incl. self.k)
+        super().__init__(config=config, slide_representation_paths=slide_representation_paths, params=params, **kwargs)
+
         self.is_slide = (self.mode == "slide")  # always False with supports={"patch"}, kept for consistency
 
         # Annotations
@@ -66,7 +87,7 @@ class RetCCLSearch(SearchMethodBase):
         self._build_patch_features(self.paths)
 
         # Class weights like your original
-        self.class_weight = self._compute_class_weights(factor=10.0)
+        self.class_weight = self._compute_class_weights(factor=self.class_weight_factor)
 
     # ------------------------------
     # Builders
@@ -86,7 +107,7 @@ class RetCCLSearch(SearchMethodBase):
             s = RetCCLSlide(slide_id, patient_id, label, feats)
             self.slide_index[slide_id] = s
     
-    def _compute_class_weights(self, factor: float = 10.0):
+    def _compute_class_weights(self, factor: int = 10):
         """
         Mirror RETCCL: weight[label] ∝ 1 / count(label), then normalized so the sum ≈ factor.
         """
@@ -166,18 +187,17 @@ class RetCCLSearch(SearchMethodBase):
         Bag = dict(sorted(Bag.items(), key=lambda x: Entropy[x[0]], reverse=True))
 
         # eta threshold
-        # eta threshold
         kq = q_feats.shape[0]                  # number of query patches
         eta_threshold = 0.0
         for idx in range(kq):
-            top5 = [s for (_, s) in Bag.get(idx, [])[:5]]   # top-5 sims for this patch
+            top5 = [s for (_, s) in Bag.get(idx, [])[:self.topk_per_patch]]   # top-5 sims for this patch
             eta_threshold += _safe_mean(top5)                # add this patch's mean(top5)
         eta_threshold /= max(kq, 1)                          # average over all patches
 
         # filter bags
         drop_ids = []
         for idx, bag in Bag.items():
-            if _safe_mean([s for (_, s) in bag[:5]]) < eta_threshold:
+            if _safe_mean([s for (_, s) in bag[:self.topk_per_patch]]) < eta_threshold:
                 drop_ids.append(idx)
         for idx in drop_ids:
             del Bag[idx]
@@ -185,7 +205,7 @@ class RetCCLSearch(SearchMethodBase):
         # majority vote per bag -> slide list
         WSIRet = {}
         for _, bag in Bag.items():
-            top5 = bag[:5]
+            top5 = bag[:self.topk_per_patch]
             if not top5:
                 continue
 

@@ -14,10 +14,10 @@ from sklearn.cluster import KMeans
 from .base import MosaicSelector
 from .registry import register_mosaic_selectors
 
+logger = logging.getLogger(__name__)
+
 @register_mosaic_selectors
 class SDMFeatures(MosaicSelector):
-    name = "SDM_features"
-
     """
     Selection of Distinct Morphologies (SDM)
     ----------------------------------------
@@ -45,11 +45,17 @@ class SDMFeatures(MosaicSelector):
         coords (np.ndarray[int]): Nx2 array of [x, y] per patch.
         groups (dict[int, np.ndarray]): group_id -> array of member indices.
     """
-    
+    name = "SDM_features"
+    HYPERPARAMS = {}  # no hyperparameters
+
+    def __init__(self, params, config):
+        super().__init__(params, config)
+        self.random_state = (self.config.get("experiment", {}) or {}).get("random_state", None)
+
     def run(self, patches, **_):
 
         if not patches:
-            logging.warning("Empty patch list provided to SDM.")
+            logger.warning("Empty patch list provided to SDM.")
             return [], np.array([], dtype=int), np.empty((0, 2), dtype=int), {}
 
         # ---- Stack features and compute centroid ----
@@ -70,7 +76,7 @@ class SDMFeatures(MosaicSelector):
         groups = {g: np.where(group_ids == g)[0] for g in range(len(unique_bins))}
 
         # ---- Reproducible selection: one index per group ----
-        rng = np.random.default_rng(self.config.get("experiment", {}).get("random_state", None))
+        rng = np.random.default_rng(self.random_state)
         selected = [int(rng.choice(idx_arr)) for idx_arr in groups.values()]
 
         # ---- Coords alongside groups ----

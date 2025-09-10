@@ -78,10 +78,16 @@ class YottixelSearch(SearchMethodBase):
     """
     name = "yottixel"
     supports = {"patch", "slide"}
+    HYPERPARAMS = {
+        "k": {"type": int, "default": 10, "min": 1, 
+              "help": "retrieval depth (top-k)", 
+              "attr": "k",
+              "include_in_id": True, "id_order": 0,
+              },
+    }
 
-    def __init__(self, config: dict, slide_representation_paths: dict, k: int = 3, **kwargs):
-        # base sets: self.config, self.paths, self.k, self.mode ("patch" or "slide")
-        super().__init__(config=config, slide_representation_paths=slide_representation_paths, k=k, **kwargs)
+    def __init__(self, config: dict, slide_representation_paths: dict, params: dict, **kwargs):
+        super().__init__(config=config, slide_representation_paths=slide_representation_paths, params=params, **kwargs)
 
         self.bobs = []
         self.is_slide = (self.mode == "slide")  # keep the boolean if other code expects it

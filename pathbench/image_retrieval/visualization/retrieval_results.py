@@ -172,7 +172,7 @@ def visualize_retrieval_result(
     with both query and hit metadata constrained in height. When text exceeds available
     vertical space, it is truncated and an ellipsis ("…") is appended as the last line.
     """
-    rr_cfg = config.get("visualization", {}).get("retrieval_report", {})
+    rr_cfg = config['experiment'].get("visualization", {}).get("retrieval_report", {})
     include_metadata = rr_cfg.get("include_metadata", True)
 
     # 1) unpack

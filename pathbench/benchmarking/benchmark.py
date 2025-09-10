@@ -110,6 +110,16 @@ def extract_features(config : dict, project : sf.Project):
         for parameter_name, parameter_value in zip(config['benchmark_parameters'].keys(), combination):
             combination_dict[parameter_name] = parameter_value
         
+        tile_px = combination_dict["tile_px"]
+        tile_um_raw = combination_dict["tile_um"]
+        tile_um = str(tile_um_raw) if str(tile_um_raw).endswith("x") else f"{tile_um_raw}um"
+
+        normalization = combination_dict["normalization"]
+        extractor = combination_dict["feature_extraction"].lower()
+
+        tile_string = f"{tile_px}px_{tile_um}"
+        feature_string = f"{tile_string}_{normalization}_{extractor}"
+
         try:
 
             all_data = project.dataset(tile_px=combination_dict['tile_px'],
@@ -118,23 +128,25 @@ def extract_features(config : dict, project : sf.Project):
             logging.info("Extracting tiles...")
             qc_list, qc_filters = build_qc_list(config)
             all_data.extract_tiles(enable_downsample=True,
-                                      save_tiles=config['experiment']['save_tiles'] if 'save_tiles' in config['experiment'] else False,
-                                      qc=qc_list,
-                                      grayspace_fraction = float(qc_filters['grayspace_fraction']),
-                                      whitespace_fraction = float(qc_filters['whitespace_fraction']),
-                                      grayspace_threshold = float(qc_filters['grayspace_threshold']),
-                                      whitespace_threshold = int(qc_filters['whitespace_threshold']),
-                                      num_threads = config['experiment']['num_workers'] if 'num_workers' in config['experiment'] else 1,
-                                      report=config['experiment']['report'] if 'report' in config['experiment'] else False,
-                                      skip_extracted=config['experiment']['skip_extracted'] if 'skip_extracted' in config['experiment'] else True,)
+                                   save_tiles=config['experiment']['save_tiles'] if 'save_tiles' in config['experiment'] else False,
+                                   qc=qc_list,
+                                   grayspace_fraction = float(qc_filters['grayspace_fraction']),
+                                   whitespace_fraction = float(qc_filters['whitespace_fraction']),
+                                   grayspace_threshold = float(qc_filters['grayspace_threshold']),
+                                   whitespace_threshold = int(qc_filters['whitespace_threshold']),
+                                   num_threads = config['experiment']['num_workers'] if 'num_workers' in config['experiment'] else 1,
+                                   report=config['experiment']['report'] if 'report' in config['experiment'] else False,
+                                   skip_extracted=config['experiment']['skip_extracted'] if 'skip_extracted' in config['experiment'] else True,)
             
             #Set save string
-            save_string, string_without_mil = get_save_strings(combination_dict)
+            #save_string, string_without_mil = get_save_strings(combination_dict)
+
             #Define the feature extractor
             feature_extractor = build_feature_extractor(combination_dict['feature_extraction'].lower(),
                                                         tile_px=combination_dict['tile_px'])
+            
             logging.info("Feature extraction...")
-            bags = generate_bags(config, project, all_data, combination_dict, string_without_mil, feature_extractor)
+            bags = generate_bags(config, project, all_data, combination_dict, feature_string, feature_extractor)
             logging.info(f"Feature extraction for combination {combination} finished...")
         except Exception as e:
             logging.warning(f"Combination {combination} was not succesfully trained due to Error {e}")

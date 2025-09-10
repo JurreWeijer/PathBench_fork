@@ -17,9 +17,6 @@ logger = logging.getLogger(__name__)
 
 @register_mosaic_selectors
 class SPLICERGB(MosaicSelector):
-    name = "SPLICE_rgb"
-    param_key = "percentile_threshold"
-
     """
     SPLICE RGB Mosaic Selection
     --------------------------
@@ -44,17 +41,33 @@ class SPLICERGB(MosaicSelector):
         “SPLICE -- Streamlining Digital Pathology Image Processing.” arXiv, April 26, 2024. https://doi.org/10.48550/arXiv.2404.17704.
     """ 
 
-    def run(self, patches, *, percentile_threshold: int, **_):
+    name = "SPLICE_rgb"
+
+    # One tunable hyperparameter: percentile threshold for suppression
+    HYPERPARAMS = {
+        "percentile_threshold": {
+            "type": float, "default": 25.0, "min": 0.0, "max": 100.0,
+            "help": "Percentile (0–100) of distances used as suppression threshold.",
+            "attr": "percentile_threshold",
+            "include_in_id": True, "id_order": 0,
+        },
+    }
+
+    def __init__(self, params, config):
+        super().__init__(params, config)
+        self.percentile_threshold = self._get_hp("percentile_threshold")
+
+    def run(self, patches, **_):
         
         if patches is None or len(patches) == 0:
-            logging.warning("Empty patch list provided to SPLICE-RGB.")
+            logger.warning("Empty patch list provided to SPLICE-RGB.")
             return [], np.array([], dtype=int), np.empty((0, 2), dtype=int), {}
 
-        if percentile_threshold is None:
+        if self.percentile_threshold is None:
             raise ValueError("percentile_threshold must be specified for SPLICE.")
 
         # ---- Extract RGB histogram features ----
-        color_features = np.array([p['rgb_histogram'] for p in patches])
+        color_features = np.asarray([p['rgb_histogram'] for p in patches], dtype=float)
         num_patches = color_features.shape[0]
 
         selected = []
@@ -81,7 +94,7 @@ class SPLICERGB(MosaicSelector):
                 continue
 
             # Percentile-based suppression threshold
-            thresh = np.percentile(distances, percentile_threshold)
+            thresh = np.percentile(distances, self.percentile_threshold)
 
             # Suppress/assign similar patches to THIS seed's group
             members = [i]
@@ -113,9 +126,6 @@ class SPLICERGB(MosaicSelector):
 
 @register_mosaic_selectors
 class SPLICEFeatures(MosaicSelector):
-    name = "SPLICE_features"
-    param_key = "percentile_threshold"
-
     """
     SPLICE Features Mosaic Selection
     -------------------------------
@@ -139,18 +149,30 @@ class SPLICEFeatures(MosaicSelector):
         Alsaafin, Areej, Peyman Nejat, Abubakr Shafique, Jibran Khan, Saghir Alfasly, Ghazal Alabtah, and H. R. Tizhoosh. 
         “SPLICE -- Streamlining Digital Pathology Image Processing.” arXiv, April 26, 2024. https://doi.org/10.48550/arXiv.2404.17704.
     """
+    name = "SPLICE_features"
+    HYPERPARAMS = {
+        "percentile_threshold": {
+            "type": float, "default": 25.0, "min": 0.0, "max": 100.0,
+            "help": "Percentile (0–100) of distances used as suppression threshold.",
+            "attr": "percentile_threshold",
+        },
+    }
 
-    def run(self, patches, *, percentile_threshold: int, **_):
+    def __init__(self, params, config):
+        super().__init__(params, config)
+        self.percentile_threshold = self._get_hp("percentile_threshold")
+
+    def run(self, patches, **_):
         
         if patches is None or len(patches) == 0:
-            logging.warning("Empty patch list provided to SPLICE.")
+            logger.warning("Empty patch list provided to SPLICE.")
             return [], np.array([], dtype=int), np.empty((0, 2), dtype=int), {}
 
-        if percentile_threshold is None:
+        if self.percentile_threshold is None:
             raise ValueError("percentile_threshold must be specified for SPLICE.")
 
         # ---- Extract features ----
-        features = np.array([p['feature'] for p in patches])
+        features = np.asarray([p['feature'] for p in patches], dtype=float)
 
         num_patches = features.shape[0]
         selected = []
@@ -180,7 +202,7 @@ class SPLICEFeatures(MosaicSelector):
                 groups[group_id] = np.array([i], dtype=int)
                 continue
 
-            thresh = np.percentile(distances, percentile_threshold)
+            thresh = np.percentile(distances, self.percentile_threshold)
 
             # Suppress/assign similar patches to THIS seed's group
             members = [i]
