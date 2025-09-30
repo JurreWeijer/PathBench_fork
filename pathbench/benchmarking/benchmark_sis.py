@@ -150,9 +150,8 @@ def perform_tile_extraction(config, project, combination_dict):
             whitespace_threshold=int(qc_filters['whitespace_threshold']),
             num_threads=config['experiment']['num_workers'],
             report=config['experiment']['report'],
-            roi_method= roi_method,
-            roi_filter_method= roi_filter,
-            max_downsample = 4
+            roi_method=roi_method,
+            roi_filter_method=roi_filter
         )
     except Exception as e:
         logging.error(f"Tile extraction failed: {e}")
