@@ -63,7 +63,7 @@ class YottixelRGB(MosaicSelector):
                           },
     }
 
-    def __init__(self, params, config):
+    def __init__(self, params, config, **kwargs):
         super().__init__(params, config)
         # parse + clamp
         self.n_clusters    = self._get_hp("n_clusters")
@@ -155,7 +155,7 @@ class YottixelFeatures(MosaicSelector):
         "perc_selected": {"type": float, "default": 1.0, "min": 0.0, "max": 100.0, "help": "Percent reps per group", "attr": "perc_selected"},
     }
 
-    def __init__(self, params, config):
+    def __init__(self, params, config, **kwargs):
         super().__init__(params, config)
         # parse + clamp
         self.n_clusters    = self._get_hp("n_clusters")

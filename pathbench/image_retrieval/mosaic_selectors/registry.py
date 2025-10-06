@@ -1,6 +1,6 @@
 # registry.py
 from __future__ import annotations
-from typing import Dict, Type, Optional
+from typing import Dict, Type, Optional, Any
 import logging
 
 logger = logging.getLogger(__name__)
@@ -27,49 +27,40 @@ def list_mosaic_selectors() -> list[str]:
 def has_mosaic_selector(name: str) -> bool:
     return name.lower() in _mosaic_selectors
 
-def build_mosaic_selector(name: str, params: dict, config: dict):
-    """
-    Instantiate a registered mosaic selector by **plain name** (no hyphen param).
-    """
+def get_mosaic_selector_class(name: str) -> Type:
     cls = _mosaic_selectors.get(name.lower())
     if cls is None:
         available = ", ".join(list_mosaic_selectors())
         raise ValueError(f"Unknown mosaic selector '{name}'. Available: [{available}]")
-    return cls(params, config)
+    return cls
 
-# registry.py
-from typing import Dict, Any, Optional
+def build_mosaic_selector(name: str, params: dict, config: dict, **kwargs):
+    """Instantiate a registered mosaic selector by **plain name**."""
+    cls = get_mosaic_selector_class(name)
+    return cls(params, config, **kwargs)
 
-def get_mosaic_selector_hyperparams(name: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Return the class-level hyperparameter schema for a selector.
-    """
-    cls = _mosaic_selectors.get(name.lower())
-    if cls is None:
-        available = ", ".join(list_mosaic_selectors())
-        raise ValueError(f"Unknown mosaic selector '{name}'. Available: [{available}]")
-    return cls.hyperparam_spec()
+def get_mosaic_selector_hyperparams(name: str) -> dict:
+    cls = get_mosaic_selector_class(name)
+    return getattr(cls, "HYPERPARAMS", {}) or {}
 
 def get_mosaic_selector_defaults(name: str) -> Dict[str, Any]:
-    """
-    Return {param: default} from the schema.
-    """
+    """Return {param: default} from the schema."""
     spec = get_mosaic_selector_hyperparams(name)
     return {k: v.get("default") for k, v in spec.items()}
 
-def get_mosaic_selector_values(name: str, params: Optional[Dict[str, Any]] = None, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def get_mosaic_selector_values(name: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    Instantiate (lightweight) and return the *effective* values (params merged with defaults).
+    Return effective values (defaults merged with provided params) WITHOUT instantiation.
+    Used for building ID strings safely.
     """
-    cls = _mosaic_selectors.get(name.lower())
-    if cls is None:
-        available = ", ".join(list_mosaic_selectors())
-        raise ValueError(f"Unknown mosaic selector '{name}'. Available: [{available}]")
-    inst = cls(params or {}, config or {})
-    return inst.hyperparam_values()
+    spec = get_mosaic_selector_hyperparams(name)
+    params = params or {}
+    out: Dict[str, Any] = {}
+    for k, meta in spec.items():
+        out[k] = params.get(k, meta.get("default"))
+    return out
 
 def describe_all_mosaic_selectors() -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """
-    Convenience: return {selector_name: schema} for all registered selectors.
-    """
-    return {name: cls.hyperparam_spec() for name, cls in _mosaic_selectors.items()}
+    """Convenience: return {selector_name: schema} for all registered selectors."""
+    return {name: getattr(cls, "hyperparam_spec", lambda: getattr(cls, "HYPERPARAMS", {}))()
+            for name, cls in _mosaic_selectors.items()}

@@ -10,14 +10,29 @@ import torch
 import logging
 import hashlib
 import re
-
-# Import the registry resolvers (no instantiation happens in these)
-from pathbench.image_retrieval.search_methods.registry import get_search_method_values
-from pathbench.image_retrieval.mosaic_selectors.registry import get_mosaic_selector_values
+import pickle
 
 from itertools import product
 
+# Import the registry resolvers (no instantiation happens in these)
+from ..image_retrieval.mosaic_selectors.registry import (
+    get_mosaic_selector_values,
+    get_mosaic_selector_hyperparams,
+)
+from ..image_retrieval.search_methods.registry import (
+    get_search_method_values,
+    get_search_method_hyperparams,
+)
+
 logger = logging.getLogger(__name__)
+
+def load_pkl(fpath):
+    with open(fpath, "rb") as f:
+        return pickle.load(f)
+    
+def save_pkl(filename, save_object):
+	with open(filename,'wb') as f:
+	    pickle.dump(save_object, f)
 
 def load_polygons_for_slide(
     roi_folder: str,
@@ -579,46 +594,48 @@ def build_param_id_string(
     """
     Build a path-safe ID from parameter values (no heavy instantiation).
 
-    - Reads effective values via your value helpers:
+    - Reads effective values via registry helpers:
         get_mosaic_selector_values(name, params) -> dict
         get_search_method_values(name, params)   -> dict
-    - Tries to fetch the class HYPERPARAMS to honor:
-        include_in_id (default True), id_label, id_order
-      Falls back to including all keys in alpha order if spec isn't available.
+    - Tries to fetch the class HYPERPARAMS via:
+        get_mosaic_selector_hyperparams(name) / get_search_method_hyperparams(name)
+      to honor include_in_id (default True), id_label, id_order.
+      If unavailable, falls back to including all keys in alpha order.
     - If compact=True -> values only in order, e.g. '10-375-375'
       else labeled, e.g. 'k10-pre375-succ375'
     """
     params = params or {}
 
-    # 1) fetch values dict
-    if kind == "selector":
-        from ..image_retrieval.utils import get_mosaic_selector_values
-        values = get_mosaic_selector_values(name, params)  # <-- dict only
-        # best-effort fetch of spec for labels/order/inclusion
-        try:
-            from ..image_retrieval.mosaic_selectors.registry import get_mosaic_selector_class
-            cls = get_mosaic_selector_class(name)
-            spec = getattr(cls, "HYPERPARAMS", {}) or {}
-        except Exception:
-            spec = {}
-    elif kind == "search":
-        from ..image_retrieval.utils import get_search_method_values
-        values = get_search_method_values(name, params)    # <-- dict only
-        try:
-            from ..image_retrieval.search_methods.registry import get_search_method_class
-            cls = get_search_method_class(name)
-            spec = getattr(cls, "HYPERPARAMS", {}) or {}
-        except Exception:
-            spec = {}
-    else:
-        raise ValueError(f"Unknown kind '{kind}' (expected 'selector' or 'search').")
+    # 1) fetch effective values and (optionally) schema
+    values: Dict[str, Any] = {}
+    spec: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        if kind == "selector":
+            values = get_mosaic_selector_values(name, params) or {}
+            try:
+                spec = get_mosaic_selector_hyperparams(name) or {}
+            except Exception:
+                spec = {}
+        elif kind == "search":
+            values = get_search_method_values(name, params) or {}
+            try:
+                spec = get_search_method_hyperparams(name) or {}
+            except Exception:
+                spec = {}
+        else:
+            raise ValueError(f"Unknown kind '{kind}' (expected 'selector' or 'search').")
+    except Exception:
+        # Last-resort: just use provided params alpha-sorted
+        values = dict(params)
+        spec = {}
 
     if not values:
         return ""
 
     # 2) collect items honoring spec when available
     items = []
-    # Prefer spec order if we have it; otherwise key-sorted values
+    # prefer declared order when we have spec; else alphabetical
     keys_in_order = list(spec.keys()) if spec else sorted(values.keys())
 
     for key in keys_in_order:
@@ -631,16 +648,17 @@ def build_param_id_string(
         order = meta.get("id_order", 1_000_000)
         items.append((order, label, key, values[key]))
 
-    # If spec was empty, we may have skipped keys not in spec; include remaining (alpha)
+    # If spec was empty, ensure all keys are included
     if not spec:
-        remaining = [k for k in sorted(values.keys()) if k not in {i[2] for i in items}]
-        for k in remaining:
-            items.append((1_000_000, k, k, values[k]))
+        already = {k for _, _, k, _ in items}
+        for k in sorted(values.keys()):
+            if k not in already:
+                items.append((1_000_000, k, k, values[k]))
 
     if not items:
         return ""
 
-    # 3) stable order
+    # 3) stable sort
     items.sort(key=lambda t: (t[0], t[1]))
 
     # 4) build tokens
@@ -651,7 +669,7 @@ def build_param_id_string(
 
     param_id = "-".join(tokens)
 
-    # 5) length guard
+    # 5) length guard with tiny hash
     if len(param_id) > max_len:
         payload = {k: v for _, _, k, v in items}
         h = _stable_hash(payload)

@@ -55,7 +55,7 @@ import joblib
 from collections import defaultdict, Counter
 import re
 import random
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import multiprocessing as mp
 
 import psutil, gc, tempfile, errno
@@ -81,7 +81,7 @@ from ..image_retrieval.visualization.mosaic_selection import generate_mosaic_sel
 from ..image_retrieval.evaluation import evaluate_retrieval_metrics, parse_metric_names
 from ..image_retrieval.visualization.retrieval_results import generate_image_retrieval_report_pdf
 from ..image_retrieval.visualization.umap import run_umap_visualizations
-from ..image_retrieval.mosaic_selectors import splice, yottixel, sdm, hshr 
+from ..image_retrieval.mosaic_selectors import splice, yottixel, sdm, hshr, pbms 
 from ..image_retrieval.mosaic_selectors.registry import build_mosaic_selector
 from ..image_retrieval.search_methods.registry import build_search_method, list_search_methods
 
@@ -211,7 +211,7 @@ def make_patch_mosaic(args):
     """
     (slide_id, tfr_path, feats_pt, feats_idx,
      patches_pkl_folder, mosaic_folder,
-     patch_size, selector_name, selector_params, config) = args  
+     patch_size, selector_name, selector_params, config, selector_kwargs) = args  
 
     # ---- Paths to the **patch** dictionary dump ----
     patches_pkl = os.path.join(patches_pkl_folder, f"{slide_id}.pkl")
@@ -232,20 +232,32 @@ def make_patch_mosaic(args):
     groups_json    = os.path.join(mosaic_folder, f"{slide_id}_groups.json")  # optional
 
     if not (os.path.exists(mosaic_pkl) and os.path.getsize(mosaic_pkl) > 0):
-        # Build selector in the worker (don’t pickle instances across processes)
-        patch_selector = build_mosaic_selector(selector_name, selector_params, config)
+        patch_selector = build_mosaic_selector(
+            selector_name, selector_params, config, **(selector_kwargs or {})
+        )
 
         # Run selection (kwargs may be empty for methods without a param)
         selected, group_ids, coords, groups = patch_selector.run(patch_data["patches"], **{})
 
         subset = [patch_data["patches"][i] for i in selected]
 
-        save_patch_dicts_pickle(
-            {"properties": patch_data["properties"], "patches": subset},
-            mosaic_pkl,
-            compress=3
-        )
+        # let the selector contribute extra data (optional)
+        try:
+            additional_data = patch_selector.additional_data()
+            if not isinstance(additional_data, dict):
+                logging.warning(f"{selector_name}.additional_data did not return dict; ignoring.")
+                additional_data = {}
+        except Exception as e:
+            logging.warning(f"additional_data failed for {slide_id}: {e}")
+            additional_data = {}
 
+        mosaic_dict = {
+            "properties": patch_data["properties"],
+            "patches": subset,
+        }
+        mosaic_dict.update(additional_data)
+
+        save_patch_dicts_pickle(mosaic_dict, mosaic_pkl, compress=3)
         np.savez_compressed(patch_ids_npz, bin_ids=group_ids, coords=coords)
 
         try:
@@ -257,10 +269,9 @@ def make_patch_mosaic(args):
 
     return (slide_id, mosaic_pkl, None)
 
-def make_slide_mosaic(
+"""def make_slide_mosaic(
     args
 ):
-    """
     Build a “mosaic” pickle for a slide‐foundation model by pretending
     it’s just a single patch at (0,0).  Saves:
 
@@ -269,7 +280,6 @@ def make_slide_mosaic(
       {slide_id}.npz  → bin_ids=[0], coords=[[0,0]]
 
     which exactly matches what your existing code expects.
-    """
 
     (slide_id, tfr_path, feats_pt, feats_idx,
      patches_pkl_folder, mosaic_folder,
@@ -312,7 +322,7 @@ def make_slide_mosaic(
                         bin_ids=np.array([0], dtype=int),
                         coords =np.array([[0, 0]], dtype=int))
 
-    return slide_id, pkl_path, None
+    return slide_id, pkl_path, None"""
 
 def create_slide_mosaic_mp(
     config,
@@ -321,85 +331,78 @@ def create_slide_mosaic_mp(
     selector_params,
     mosaics_base,
     features_folder_path,
-    patch_size
+    patch_size,
+    **selector_kwargs
 ):
-    """
-    Generate patch-mosaics for each slide, skipping slides whose mosaic already exists,
-    then parallelizing the remaining work across CPU cores.
-
-    Returns:
-        dict[slide_id → path_to_mosaic_pkl]
-    """
     logging.info(f"Running mosaic creation using method={selector_name}")
 
-    # 1) Prepare all the base‐paths/folders
     slide_mosaic_paths = {}
     mosaic_failures = {}
 
-    patches_pkl_folder = os.path.join(mosaics_base, f"patches_{os.path.basename(os.path.normpath(features_folder_path))}") #TODO: see if we can store the patches only once
+    # Per-feature patches cache (leave as-is)
+    patches_pkl_folder = os.path.join(
+        mosaics_base,
+        f"patches_{os.path.basename(os.path.normpath(features_folder_path))}"
+    )
     os.makedirs(patches_pkl_folder, exist_ok=True)
 
+    # Always suffix mosaics with features (keeps RGB/feature selectors consistent)
     features_suffix = f"_{os.path.basename(os.path.normpath(features_folder_path))}"
 
+    # ID built only from true hyperparams
     param_id = build_param_id_string("selector", selector_name, selector_params, compact=True)
     params_suffix = f"_{param_id}" if param_id else ""
+
     mosaic_folder = os.path.join(
         mosaics_base,
         f"{selector_name}{params_suffix}{features_suffix}"
     )
     os.makedirs(mosaic_folder, exist_ok=True)
 
-    # 2) First pass: classify each slide as "already done" vs. "needs work"
+    # ---- derive in_dim without mutating selector_params ----
+    first_sid = os.path.splitext(os.path.basename(next(iter(all_data.tfrecords()))))[0]
+    first_feat = torch.load(os.path.join(features_folder_path, f"{first_sid}.pt"))
+    in_dim = int(first_feat.shape[1])
+    selector_kwargs = {**selector_kwargs, "in_dim": in_dim}
+
+    # ---- schedule work ----
     to_process = []
     for tfr_path in tqdm(all_data.tfrecords(), desc="Scanning slides", file=sys.stdout):
         slide_id = os.path.splitext(os.path.basename(tfr_path))[0]
-
         feats_pt  = os.path.join(features_folder_path, f"{slide_id}.pt")
         feats_idx = os.path.join(features_folder_path, f"{slide_id}.index.npz")
 
-        # Must exist on disk
-        if not os.path.exists(feats_pt) or not os.path.exists(feats_idx):
+        if not (os.path.exists(feats_pt) and os.path.exists(feats_idx)):
             raise FileNotFoundError(
                 f"Missing features for slide {slide_id}: {feats_pt}, {feats_idx}"
             )
 
-        # Already‐computed mosaic?
         mosaic_pkl = os.path.join(mosaic_folder, f"{slide_id}.pkl")
         if os.path.exists(mosaic_pkl) and os.path.getsize(mosaic_pkl) > 0:
-            # we can immediately register it as done
             slide_mosaic_paths[slide_id] = mosaic_pkl
         else:
-            # we’ll need to build everything for this slide in the worker step
-            to_process.append(
-                (
-                    slide_id,
-                    tfr_path,
-                    feats_pt,
-                    feats_idx,
-                    patches_pkl_folder,
-                    mosaic_folder,
-                    patch_size,
-                    selector_name,
-                    selector_params,
-                    config
-                )
-            )
+            # NOTE: include patches_pkl_folder here — matches worker’s expected args
+            to_process.append((
+                slide_id, tfr_path, feats_pt, feats_idx,
+                patches_pkl_folder, mosaic_folder,
+                patch_size, selector_name, selector_params, config, selector_kwargs
+            ))
 
-    # 3) If there are slides to process, spawn a Pool
     if len(to_process) > 0:
         n_workers = min(len(to_process), max(1, mp.cpu_count() - 1))
         logging.info(f"Spawning {n_workers} workers to build {len(to_process)} mosaics...")
         with mp.Pool(n_workers) as pool:
-            for slide_id, mosaic_pkl, failure in tqdm(pool.imap_unordered(make_patch_mosaic, to_process), total=len(to_process), desc="Building mosaics", file=sys.stdout):
+            for slide_id, mosaic_pkl, failure in tqdm(
+                pool.imap_unordered(make_patch_mosaic, to_process),
+                total=len(to_process), desc="Building mosaics", file=sys.stdout
+            ):
                 if failure == "no_patches":
                     mosaic_failures.setdefault("no_patches", []).append(slide_id)
                 elif mosaic_pkl is None:
-                    # Shouldn’t really happen, but just in case
                     logging.error(f"Worker returned no path for {slide_id}")
                 else:
                     slide_mosaic_paths[slide_id] = mosaic_pkl
 
-    # 4) Write out ROI‐failure report if any
     if mosaic_failures:
         out_path = os.path.join(patches_pkl_folder, "roi_failures.json")
         with open(out_path, "w") as f:
@@ -628,6 +631,8 @@ def benchmark_sis(config, project):
                                         mosaics_base=mosaics_base,
                                         features_folder_path=features_folder_path, 
                                         patch_size=combination_dict['tile_px'], 
+                                        prototypes_base=os.path.join(project_dir, "prototyping"),
+                                        feature_string=feature_string,
                                     )
 
             slide_representation_paths = slide_mosaic_paths

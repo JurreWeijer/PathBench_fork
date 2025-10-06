@@ -53,7 +53,7 @@ class SPLICERGB(MosaicSelector):
         },
     }
 
-    def __init__(self, params, config):
+    def __init__(self, params, config, **kwargs):
         super().__init__(params, config)
         self.percentile_threshold = self._get_hp("percentile_threshold")
 
@@ -158,7 +158,7 @@ class SPLICEFeatures(MosaicSelector):
         },
     }
 
-    def __init__(self, params, config):
+    def __init__(self, params, config, **kwargs):
         super().__init__(params, config)
         self.percentile_threshold = self._get_hp("percentile_threshold")
 

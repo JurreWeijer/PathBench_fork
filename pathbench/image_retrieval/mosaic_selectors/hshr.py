@@ -38,7 +38,7 @@ class HSHRFeatures(MosaicSelector):
         },
     }
 
-    def __init__(self, params, config):
+    def __init__(self, params, config, **kwargs):
         super().__init__(params, config)
         self.n_patches = self._get_hp("n_patches")
         self.random_state = (self.config.get("experiment", {}) or {}).get("random_state", None)

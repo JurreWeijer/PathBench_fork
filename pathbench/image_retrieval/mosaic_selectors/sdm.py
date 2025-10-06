@@ -48,7 +48,7 @@ class SDMFeatures(MosaicSelector):
     name = "SDM_features"
     HYPERPARAMS = {}  # no hyperparameters
 
-    def __init__(self, params, config):
+    def __init__(self, params, config, **kwargs):
         super().__init__(params, config)
         self.random_state = (self.config.get("experiment", {}) or {}).get("random_state", None)
 

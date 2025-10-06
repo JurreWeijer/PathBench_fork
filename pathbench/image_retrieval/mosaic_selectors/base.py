@@ -12,9 +12,10 @@ class MosaicSelector:
     name: str = ""                 
     HYPERPARAMS: Dict[str, Dict[str, Any]] = {}
 
-    def __init__(self, params, config: dict) -> None:
+    def __init__(self, params, config: dict, **kwargs) -> None:
         self.config = config or {}
         self.params = params or {}
+        self.extra  = kwargs or {} 
 
     @classmethod
     def hyperparam_spec(cls) -> Dict[str, Dict[str, Any]]:
@@ -69,6 +70,11 @@ class MosaicSelector:
             if "max" in spec: val = min(spec["max"], val)
 
         return val
+    
+    def additional_data(self) -> dict:
+        """Optional hook. Return a JSON/pickle-serializable dict to store
+        under 'additional_data' in the mosaic file. Default: {}."""
+        return {}
     
     def run(self, patches: list, **kwargs) -> tuple:
         """Return (selected, group_ids, coords, groups)."""
