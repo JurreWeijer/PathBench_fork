@@ -17,6 +17,8 @@ import os
 
 from pathbench.experiment import Experiment
 
+os.environ["RICH_DISABLE"] = "1"
+
 # 1) grab the root logger and reset handlers
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
