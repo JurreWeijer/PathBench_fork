@@ -1,3 +1,4 @@
+from __future__ import annotations
 import slideflow as sf
 import numpy as np
 import joblib
@@ -11,6 +12,7 @@ import logging
 import hashlib
 import re
 import pickle
+import tempfile
 
 from itertools import product
 
@@ -265,6 +267,281 @@ def load_patch_dicts_from_tfr(
         "patches": output_patches
     }
 
+################### Load an save patch dicts with reduced size ###################
+
+# =============================================================================
+# Internal helpers
+# =============================================================================
+
+def _hash_feature_row(row: np.ndarray) -> str:
+    """
+    Compute a short, stable fingerprint for a single feature row.
+
+    Args:
+        row: np.ndarray of shape (D,), dtype float32 (will be coerced)
+
+    Returns:
+        Hex string (BLAKE2b, 16-byte digest)
+    """
+    if not isinstance(row, np.ndarray):
+        row = np.asarray(row, dtype=np.float32)
+    elif row.dtype != np.float32:
+        row = row.astype(np.float32, copy=False)
+    return hashlib.blake2b(row.tobytes(order="C"), digest_size=16).hexdigest()
+
+def _atomic_dump(obj: Any, path: str, compress: int = 3) -> None:
+    """
+    Atomically write a joblib file to avoid partially-written outputs.
+
+    Args:
+        obj: Python object to serialize.
+        path: Destination path.
+        compress: Joblib compression level (0..9).
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".mosaic_tmp_", dir=directory)
+    os.close(fd)
+    try:
+        joblib.dump(obj, tmp, compress=compress)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+def _load_feature_matrix(props: Dict[str, Any]) -> np.ndarray:
+    """
+    Load the (N, D) float32 feature matrix referenced by properties['features_path'].
+
+    Args:
+        props: properties dict that must include 'features_path'.
+
+    Returns:
+        Feature matrix as np.ndarray, shape (N, D), dtype float32.
+
+    Raises:
+        ValueError if required keys are missing or types/shapes are invalid.
+    """
+    feature_path = props.get("features_path")
+    if not feature_path:
+        raise ValueError("properties missing 'features_path'")
+
+    feats = torch.load(feature_path, map_location="cpu")
+    arr = feats.numpy() if hasattr(feats, "numpy") else np.asarray(feats)
+
+    if not isinstance(arr, np.ndarray) or arr.ndim != 2:
+        raise ValueError("features tensor must be a 2D array (N, D)")
+    if arr.dtype != np.float32:
+        raise ValueError("features dtype must be float32")
+
+    return arr
+
+def _is_new_schema(payload: Dict[str, Any]) -> bool:
+    """
+    Detect NEW on-disk schema:
+      - Top-level dict has 'properties' and 'patches'
+      - properties contains 'features_index_path'
+      - each patch has 'feature_index' and 'feature_hash'
+
+    Args:
+        payload: Deserialized joblib dict.
+
+    Returns:
+        True if payload matches new schema; False otherwise.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if "properties" not in payload or "patches" not in payload:
+        return False
+
+    props = payload["properties"]
+    patches = payload["patches"]
+    if not isinstance(props, dict) or not isinstance(patches, list) or not patches:
+        return False
+    if "features_index_path" not in props:
+        return False
+
+    first = patches[0]
+    return isinstance(first, dict) and "feature_index" in first and "feature_hash" in first
+
+# =============================================================================
+# Public API
+# =============================================================================
+
+def save_patch_dicts_pickle_new(patch_data: Dict[str, Any], path: str, compress: int = 3) -> None:
+    """
+    Save a mosaic dict in the NEW schema.
+
+    INPUT STRUCTURE (required keys; others are preserved as-is):
+        patch_data: dict with
+          - 'properties': dict with:
+              * 'features_path': str -> path to <slide_id>.pt (feature matrix)
+              * 'features_index_path': str -> path to <slide_id>.index.npz (coords index)
+          - 'patches': list[dict], each with:
+              * 'loc': tuple(int,int)  # (x, y) in level-0 pixels
+              * 'feature_index': int   # row in features matrix
+            (any other per-patch keys are preserved)
+
+    ON-DISK CHANGES:
+      - For each patch, add 'feature_hash' (fingerprint of features[row]).
+      - Remove 'feature' array from on-disk payload (keeps files small).
+      - Preserve ALL other top-level keys (e.g., 'prototyping').
+
+    Raises:
+        ValueError if required fields are missing or inconsistent.
+    """
+    if "properties" not in patch_data or "patches" not in patch_data:
+        raise ValueError("patch_data must contain 'properties' and 'patches'")
+
+    props = patch_data["properties"]
+    patches = patch_data["patches"]
+
+    # Strict property checks
+    for key in ("features_path", "features_index_path"):
+        if key not in props:
+            raise ValueError(f"properties missing '{key}'")
+
+    features = _load_feature_matrix(props)
+    num_rows = features.shape[0]
+
+    # Build output without mutating the input
+    out: Dict[str, Any] = dict(patch_data)
+    simplified: List[Dict[str, Any]] = []
+
+    for i, patch in enumerate(patches):
+        if not isinstance(patch, dict):
+            raise ValueError(f"patch[{i}] must be a dict")
+        if "loc" not in patch or "feature_index" not in patch:
+            raise ValueError(f"patch[{i}] missing 'loc' and/or 'feature_index'")
+
+        x, y = patch["loc"]
+        if not (isinstance(x, (int, np.integer)) and isinstance(y, (int, np.integer))):
+            raise ValueError(f"patch[{i}] 'loc' must be a tuple of ints (x, y)")
+
+        idx = int(patch["feature_index"])
+        if not (0 <= idx < num_rows):
+            raise ValueError(f"patch[{i}] feature_index {idx} out of bounds (N={num_rows})")
+
+        p = dict(patch)
+        p["feature_hash"] = _hash_feature_row(features[idx])
+        p.pop("feature", None)  # drop large arrays from disk
+        simplified.append(p)
+
+    out["patches"] = simplified
+    _atomic_dump(out, path, compress=compress)
+
+def load_patch_dicts_pickle_new(path: str, reconstruct_features: bool = False) -> Dict[str, Any]:
+    """
+    Load a mosaic dict, verifying correctness and auto-migrating legacy payloads.
+
+    BEHAVIOR:
+      - NEW schema:
+          * If reconstruct_features=False: return dict as saved (no 'feature' arrays attached).
+          * If reconstruct_features=True: verify 'feature_hash' for each patch, then
+            attach 'feature' arrays in memory.
+      - OLD schema:
+          * Load using `load_patch_dicts_pickle_legacy(..., reconstruct_features=True)`.
+          * Upgrade in-place to NEW schema:
+              - Add 'feature_hash' per patch.
+              - Remove 'feature' from on-disk payload.
+          * Return upgraded dict; attach 'feature' arrays if reconstruct_features=True.
+
+    OUTPUT STRUCTURE:
+      dict with (at minimum):
+        - 'properties': dict (unchanged from disk)
+        - 'patches': list[dict]
+            * if reconstruct_features=True: each patch includes 'feature' (np.ndarray (D,))
+            * always includes 'feature_index', 'loc', and in NEW schema also 'feature_hash'
+      (All other top-level keys are preserved as-is.)
+
+    Raises:
+        ValueError if required fields are missing or hashes/indexes fail validation.
+    """
+    payload = joblib.load(path)
+
+    # --- NEW SCHEMA PATH ---
+    if _is_new_schema(payload):
+        props = payload["properties"]
+        if not reconstruct_features:
+            return payload
+
+        features = _load_feature_matrix(props)
+        num_rows = features.shape[0]
+
+        reconstructed: List[Dict[str, Any]] = []
+        for i, patch in enumerate(payload["patches"]):
+            if "feature_index" not in patch or "feature_hash" not in patch:
+                raise ValueError(f"{path}: patch[{i}] missing 'feature_index' or 'feature_hash'")
+
+            idx = int(patch["feature_index"])
+            if not (0 <= idx < num_rows):
+                raise ValueError(f"{path}: patch[{i}] feature_index {idx} out of bounds (N={num_rows})")
+
+            row = features[idx]
+            if _hash_feature_row(row) != str(patch["feature_hash"]):
+                raise ValueError(f"{path}: patch[{i}] feature hash mismatch at index {idx}")
+
+            p = dict(patch)
+            p["feature"] = row
+            reconstructed.append(p)
+
+        out: Dict[str, Any] = dict(payload)
+        out["patches"] = reconstructed
+        return out
+
+    # --- LEGACY SCHEMA PATH (auto-migrate) ---
+    legacy = load_patch_dicts_pickle_legacy(path, reconstruct_features=True)
+    if "properties" not in legacy or "patches" not in legacy:
+        raise ValueError(f"{path}: legacy file missing 'properties'/'patches'")
+
+    props = legacy["properties"]
+    for key in ("features_path", "features_index_path"):
+        if key not in props:
+            raise ValueError(f"{path}: properties missing required '{key}' for upgrade")
+
+    features = _load_feature_matrix(props)
+    num_rows = features.shape[0]
+
+    upgraded: Dict[str, Any] = dict(legacy)
+    on_disk_patches: List[Dict[str, Any]] = []
+    in_memory_patches: List[Dict[str, Any]] = []
+
+    for i, patch in enumerate(legacy["patches"]):
+        if "feature_index" not in patch or "loc" not in patch:
+            raise ValueError(f"{path}: legacy patch[{i}] missing 'feature_index' or 'loc'")
+
+        idx = int(patch["feature_index"])
+        if not (0 <= idx < num_rows):
+            raise ValueError(f"{path}: patch[{i}] feature_index {idx} out of bounds")
+
+        # Use the reconstructed feature from legacy loader (if present); else use features[idx]
+        row = patch.get("feature", features[idx])
+        row_hash = _hash_feature_row(row)
+
+        # On-disk version (compact, no 'feature' array)
+        p_store = dict(patch)
+        p_store["feature_hash"] = row_hash
+        p_store.pop("feature", None)
+        on_disk_patches.append(p_store)
+
+        # In-memory return version (with 'feature' attached if requested)
+        if reconstruct_features:
+            p_mem = dict(p_store)
+            p_mem["feature"] = row
+            in_memory_patches.append(p_mem)
+
+    upgraded["patches"] = on_disk_patches
+    _atomic_dump(upgraded, path, compress=3)  # write back in NEW schema
+
+    if reconstruct_features:
+        out: Dict[str, Any] = dict(upgraded)
+        out["patches"] = in_memory_patches
+        return out
+    
+    return upgraded
+
 def save_patch_dicts_pickle(patch_data, path, compress=3):
     """
     Save patch dictionaries to disk with reduced size using joblib.
@@ -297,7 +574,10 @@ def save_patch_dicts_pickle(patch_data, path, compress=3):
             copy["feature_index"] = int(idxs[0])
         simplified.append(copy)
 
-    joblib.dump({"properties": props, "patches": simplified}, path, compress=compress)
+    out = dict(patch_data)
+    out["patches"] = simplified
+
+    joblib.dump(out, path, compress=compress)
 
 def load_patch_dicts_pickle(path, reconstruct_features=False):
     """
@@ -315,6 +595,7 @@ def load_patch_dicts_pickle(path, reconstruct_features=False):
     if not reconstruct_features:
         # nothing to do—just return the saved dict
         return data
+    
     props = data["properties"]
     feature_path = props.get("features_path")
     if not feature_path:
@@ -330,7 +611,11 @@ def load_patch_dicts_pickle(path, reconstruct_features=False):
             copy["feature"] = arr[idx]
         recon.append(copy)
 
-    return {"properties": props, "patches": recon}
+    out = dict(data)
+    out["patches"] = recon
+    return out
+
+#################### Save retrieval metrics and results ###################
 
 def save_retrieval_metrics(config, metric_results, output_path):
     """

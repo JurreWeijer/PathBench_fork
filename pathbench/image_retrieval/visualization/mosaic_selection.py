@@ -368,12 +368,21 @@ def visualize_mosaic_selection_extensive(
         overlay = thumb_bin.copy()
         palette = generate_distinct_bgr_colors(len(unique_bins))
 
+        # Force group/bin 0 to be light gray (BGR); keep others as they are now
+        LIGHT_GRAY = (200, 200, 200)  # light gray in BGR
+        bin_to_color = {}
+        for i, b in enumerate(unique_bins):
+            if b == 0:
+                bin_to_color[b] = LIGHT_GRAY
+            else:
+                bin_to_color[b] = palette[i]
+
         # Fill each tile with its bin color
         for i in range(coords.shape[0]):
             if i not in idx_to_bin:
                 continue
             b = idx_to_bin[i]
-            color = palette[unique_bins.index(b)]
+            color = bin_to_color[b]
 
             x0_fr, y0_fr = int(coords[i][0]), int(coords[i][1])
             x0_th, y0_th = to_thumb_xy(x0_fr, y0_fr)
@@ -412,7 +421,7 @@ def visualize_mosaic_selection_extensive(
         total_legend_height = len(unique_bins) * SWATCH_SIZE + (len(unique_bins) - 1) * SWATCH_PAD
         legend_y = (MAX_THUMB_SIZE - total_legend_height) // 2
         for i, bin_id in enumerate(unique_bins):
-            color = palette[i]
+            color = bin_to_color[bin_id]
             y0    = legend_y + i * (SWATCH_SIZE + SWATCH_PAD)
             cv2.rectangle(thumb_bin, (legend_x, y0),
                           (legend_x + SWATCH_SIZE, y0 + SWATCH_SIZE), color, -1)
@@ -422,31 +431,6 @@ def visualize_mosaic_selection_extensive(
                 (legend_x + SWATCH_SIZE + 5, y0 + SWATCH_SIZE - 5),
                 FONT, 1.0, (0, 0, 0), 2, cv2.LINE_AA
             )
-
-    """# --- 7) Right panel: FILLED black squares + white indices (all selected patches) ---
-    mosaic_pkl_path = os.path.join(mosaics_folder, f"{slide_id}.pkl")
-    patch_data = load_patch_dicts_pickle(mosaic_pkl_path, reconstruct_features=False)
-
-    for idx, p in enumerate(patch_data["patches"]):
-        x0_fr, y0_fr = p["loc"]
-        dx, dy = to_thumb_xy(int(x0_fr), int(y0_fr))
-
-        # filled black square for patch footprint
-        cv2.rectangle(
-            thumb_idx,
-            (dx, dy),
-            (dx + thumb_patch_w - 1, dy + thumb_patch_h - 1),
-            (0, 0, 0),
-            thickness=-1
-        )
-
-        # centered white index with a thin black outline for contrast
-        txt = str(idx)
-        (w_txt, h_txt), _ = cv2.getTextSize(txt, FONT, 0.8, 2)
-        tx = dx + (thumb_patch_w - w_txt) // 2
-        ty = dy + (thumb_patch_h + h_txt) // 2
-        cv2.putText(thumb_idx, txt, (tx, ty), FONT, 0.8, (255, 255, 255), 3, cv2.LINE_AA)
-        cv2.putText(thumb_idx, txt, (tx, ty), FONT, 0.8, (0, 0, 0),   1, cv2.LINE_AA)"""
     
     # --- 7) Draw patch indices on thumb_idx & load thumbnails (reuse patch_data) ---
     mosaic_pkl_path = os.path.join(mosaics_folder, f"{slide_id}.pkl")

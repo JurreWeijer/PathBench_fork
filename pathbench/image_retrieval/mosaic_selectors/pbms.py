@@ -34,6 +34,11 @@ class PBMS(MosaicSelector):
         "fix_proto":    {"type": bool, "default": True,              "attr": "fix_proto", "include_in_id": False},
         "perc_selected":{"type": float,"default": 1.0, "min": 0.0, "max": 100.0, "attr": "perc_selected", "include_in_id": True, "id_order": 12},
         "save_slide_embeddings": {"type": bool, "default": False, "help": "If True, save PANTHER slide/prototype embeddings per slide.", "attr": "save_slide_embeddings", "include_in_id": False, "id_order": 99,},
+        "r_min":        {"type": float,"default": 0.30, "min": 0.0, "max": 1.0, "help": "Soft-assign gate for prototype labeling", "attr": "r_min", "include_in_id": False, "id_order": 13,},
+        "tau_non":      {"type": float,"default": 0.90, "min": 0.0, "help": "Soft-assign gate for non-tumor labeling", "attr": "tau_non", "include_in_id": False, "id_order": 14,},
+        "N_min":        {"type": float,"default": 500.0, "min": 0.0, "help": "Min effective support for prototype labeling", "attr": "N_min", "include_in_id": False, "id_order": 15,},
+        "N_non_min":    {"type": float,"default": 250.0, "min": 0.0, "help": "Min absolute non-tumor support for prototype labeling", "attr": "N_non_min", "include_in_id": False, "id_order": 16,},
+        "manual_labeling": {"type": str, "default": None, "help": "If a value given, use manual labeling instead of automatic.", "attr": "manual_labeling", "include_in_id": True, "id_order": 17,},
     }
 
     def __init__(self, params, config, **kwargs):
@@ -63,8 +68,14 @@ class PBMS(MosaicSelector):
         self.prototype_path = os.path.join(self.prototype_folder, "prototypes.pkl")
         if not os.path.exists(self.prototype_path):
             raise FileNotFoundError(f"PBMS: prototypes not found at {self.prototype_path}")
-        
-        self.prototype_label_path = os.path.join(self.prototype_folder, "proto_labels.json")
+
+        if self.manual_labeling is not None:
+            proto_labels_file_name = f"{self.manual_labeling}.json" 
+        else:
+            proto_labels_file_name = f"proto_labels_r{self.r_min}_tau{self.tau_non}_N{int(self.N_min)}_Nnon{int(self.N_non_min)}.json"
+
+        self.prototype_label_path = os.path.join(self.prototype_folder, proto_labels_file_name)
+        logging.info("Labels used from: %s", self.prototype_label_path)
         if not os.path.exists(self.prototype_label_path):
             raise FileNotFoundError(f"PBMS: prototype labels not found at {self.prototype_label_path}")
 
@@ -90,7 +101,6 @@ class PBMS(MosaicSelector):
                 f"PBMS: prototype mask size {self.non_tumor_mask.shape[0]} "
                 f"!= n_proto {self.n_proto}"
             )
-        
         
     def load_non_tumor_mask(self):
         with open(self.prototype_label_path, "r") as f:

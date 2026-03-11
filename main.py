@@ -1,3 +1,9 @@
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import slideflow.slide.backends.vips as vips_backend
 
 # Wrap the existing detect_mpp to fall back to 0.25 when it returns None
@@ -13,7 +19,6 @@ import sys
 import logging
 import argparse
 import torch
-import os
 
 from pathbench.experiment import Experiment
 
